@@ -8,8 +8,8 @@ Override the connection with env vars:
     DRONE_CONN=/dev/ttyACM0   (or a MAVProxy UDP output, e.g. udp:127.0.0.1:14550)
     DRONE_BAUD=115200
 
-Point your MCP client (Claude Desktop / Claude Code config, or any MCP client)
-at this script as a stdio server. See README for the config snippet.
+Point your MCP client (Claude Desktop, Gemini MCP, or any MCP client)
+at this script as a stdio server. See README for config details.
 
 SAFETY NOTE (proof-of-concept only): there is no geofence or bounds check
 here. Before flying for real, add altitude/distance limits and a
@@ -18,7 +18,10 @@ vehicle with props on.
 """
 import os
 from mcp.server.fastmcp import FastMCP
-from drone_controller import DroneController
+try:
+    from drone_controller import DroneController
+except ImportError:
+    from Drone_Controller import DroneController
 
 CONN = os.environ.get("DRONE_CONN", "/dev/ttyACM0")
 BAUD = int(os.environ.get("DRONE_BAUD", "115200"))

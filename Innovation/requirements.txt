@@ -1,2 +1,4 @@
 pymavlink>=2.4.40
 mcp>=1.0.0
+google-genai>=1.0.0
+flask>=3.0.0

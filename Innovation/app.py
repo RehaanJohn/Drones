@@ -5,9 +5,8 @@ Self-hosted chat UI for the drone MCP agent. Runs on the Raspberry Pi.
 
 Then open http://<pi-ip>:5000 from your phone or laptop on the same network.
 
-Requires ANTHROPIC_API_KEY set in the environment (get one at
-console.anthropic.com). Billed separately/per-token from any Claude
-subscription — keep that in mind if you leave this running.
+Requires GEMINI_API_KEY set in the environment (get one at
+aistudio.google.com).
 """
 import asyncio
 import os
@@ -21,7 +20,7 @@ app = Flask(__name__)
 agent = DroneChatAgent()
 
 # Run one persistent asyncio event loop in a background thread, since the
-# MCP client session and Anthropic tool-use loop are async but Flask's
+# MCP client session and Gemini tool-use loop are async but Flask's
 # request handlers here are sync.
 _loop = asyncio.new_event_loop()
 
@@ -119,7 +118,7 @@ def chat():
 
 
 if __name__ == "__main__":
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("Set ANTHROPIC_API_KEY before starting app.py")
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise SystemExit("Set GEMINI_API_KEY before starting app.py")
     run_async(agent.connect())
     app.run(host="0.0.0.0", port=5000)

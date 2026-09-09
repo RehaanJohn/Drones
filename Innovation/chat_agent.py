@@ -117,7 +117,9 @@ class DroneChatAgent:
                 types.FunctionDeclaration(
                     name=t.name,
                     description=t.description or "",
-                    parameters_json_schema=_clean_schema(t.inputSchema),
+                    parameters_json_schema=_clean_schema(
+                        getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
+                    ),
                 )
                 for t in self.tools
             ]
@@ -129,7 +131,9 @@ class DroneChatAgent:
                         {
                             "name": t.name,
                             "description": t.description or "",
-                            "parameters": _clean_schema(t.inputSchema),
+                            "parameters": _clean_schema(
+                                getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
+                            ),
                         }
                         for t in self.tools
                     ]
@@ -196,7 +200,11 @@ class DroneChatAgent:
                 call_name = call.name
                 call_args = call.args if isinstance(call.args, dict) else (dict(call.args) if call.args else {})
                 try:
-                    result = await self.session.call_tool(call_name, call_args)
+                    try:
+                        result = await self.session.call_tool(call_name, arguments=call_args)
+                    except TypeError:
+                        result = await self.session.call_tool(call_name, call_args)
+
                     text_result = "\n".join(
                         part.text for part in result.content if hasattr(part, "text")
                     )
@@ -247,7 +255,11 @@ class DroneChatAgent:
                 call_name = call.name
                 call_args = dict(call.args) if call.args else {}
                 try:
-                    result = await self.session.call_tool(call_name, call_args)
+                    try:
+                        result = await self.session.call_tool(call_name, arguments=call_args)
+                    except TypeError:
+                        result = await self.session.call_tool(call_name, call_args)
+
                     text_result = "\n".join(
                         part.text for part in result.content if hasattr(part, "text")
                     )

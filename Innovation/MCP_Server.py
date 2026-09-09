@@ -17,7 +17,13 @@ confirmation step in goto_location / arm_drone before this touches a
 vehicle with props on.
 """
 import os
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer
+    mcp = MCPServer("Drone Control")
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
+    mcp = FastMCP("Drone Control")
+
 try:
     from drone_controller import DroneController
 except ImportError:
@@ -25,8 +31,6 @@ except ImportError:
 
 CONN = os.environ.get("DRONE_CONN", "/dev/ttyACM0")
 BAUD = int(os.environ.get("DRONE_BAUD", "115200"))
-
-mcp = FastMCP("Drone Control")
 drone = DroneController(connection_string=CONN, baud=BAUD)
 
 

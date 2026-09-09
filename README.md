@@ -215,7 +215,7 @@ mavproxy.py \
   --master=/dev/ttyACM0 \
   --baudrate=115200 \
   --out=udp:127.0.0.1:14550 \
-  --out=udp:192.168.1.13:14550
+  --out=udp:192.168.1.5:14550
 ```
 
 Then configure the MCP Agent to connect via local UDP:

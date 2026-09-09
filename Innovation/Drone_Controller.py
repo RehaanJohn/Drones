@@ -8,6 +8,8 @@ This talks directly to the Pixhawk over MAVLink (USB or TELEM2 serial).
 Run it on the Raspberry Pi, alongside MAVProxy if you want Mission Planner
 connected at the same time (see README for the MAVProxy routing setup).
 """
+import time
+
 from pymavlink import mavutil
 
 
@@ -17,10 +19,33 @@ class DroneController:
         self.baud = baud
         self.master = None
 
-    def connect(self, timeout: int = 30) -> dict:
-        """Open the MAVLink connection and wait for the first heartbeat."""
-        self.master = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
-        self.master.wait_heartbeat(timeout=timeout)
+    def connect(self, timeout: int = 30, retries: int = 3, retry_delay: float = 3.0) -> dict:
+        """Open the MAVLink connection and wait for the first heartbeat.
+
+        Retries on failure — Pixhawks over USB enumerate twice on power-up
+        (bootloader, then firmware, ~5s apart), so a connection attempt
+        made during that window can grab a stale file descriptor. A short
+        retry with a fresh connection object rides past that."""
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                if self.master:
+                    self.master.close()
+                self.master = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
+                self.master.wait_heartbeat(timeout=timeout)
+                break
+            except Exception as exc:
+                last_error = exc
+                if self.master:
+                    self.master.close()
+                    self.master = None
+                if attempt < retries:
+                    time.sleep(retry_delay)
+        else:
+            raise ConnectionError(
+                f"Failed to connect to {self.connection_string} after {retries} attempts: {last_error}"
+            )
+
         return {
             "status": "connected",
             "system_id": self.master.target_system,

@@ -1,16 +1,22 @@
 """
 DroneChatAgent — connects to the local MCP server as a client, and drives
-the Google Gemini tool-use loop so a plain chat message can trigger drone tools.
-
-Runs entirely on the companion computer (e.g. Raspberry Pi). No SSH or separate machine required.
+the AI tool-use loop (Groq or Gemini) so a plain chat message can trigger drone tools.
 """
 import asyncio
 import os
+import json
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Support Groq
+try:
+    from groq import AsyncGroq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 # Support google-genai (unified Google GenAI SDK) with fallback to google-generativeai
 try:
@@ -25,8 +31,6 @@ except ImportError:
     except ImportError:
         SDK_FLAVOR = None
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
 SYSTEM_PROMPT = (
     "You are a drone control assistant. You have tools to connect to, arm, "
     "fly, and land a real (or bench-test) drone over MAVLink. Always call "
@@ -37,7 +41,7 @@ SYSTEM_PROMPT = (
 
 
 def _clean_schema(schema: dict) -> dict:
-    """Recursively cleans and formats an OpenAPI/JSON Schema for Gemini function declarations."""
+    """Recursively cleans and formats an OpenAPI/JSON Schema for Gemini/Groq function declarations."""
     if not isinstance(schema, dict):
         return schema
 
@@ -66,7 +70,6 @@ def _clean_schema(schema: dict) -> dict:
 
 class DroneChatAgent:
     def __init__(self, server_script: str = "mcp_server.py"):
-        # Resolve script path across working directory, file location, and casing variations
         candidate_paths = [
             server_script,
             "MCP_Server.py" if server_script == "mcp_server.py" else "mcp_server.py",
@@ -76,29 +79,27 @@ class DroneChatAgent:
         resolved = next((p for p in candidate_paths if os.path.exists(p)), server_script)
         self.server_script = resolved
 
-        self.model = MODEL
         self.exit_stack = AsyncExitStack()
         self.session: ClientSession | None = None
         self.tools = []
-        self.history: List[Any] = []
-        self.client = None
+        
+        # State for Gemini
+        self.gemini_history: List[Any] = []
+        self.gemini_client = None
         self.gemini_declarations: List[Any] = []
         self._legacy_chat = None
+        
+        # State for Groq
+        self.groq_history: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.groq_client = None
+        self.groq_tools = []
+        
+        self._connected = False
 
     async def connect(self):
-        """Connect to MCP server and initialize Gemini client."""
-        if SDK_FLAVOR is None:
-            raise RuntimeError(
-                "Neither 'google-genai' nor 'google-generativeai' is installed. "
-                "Please run: pip install google-genai"
-            )
-
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY environment variable is not set. "
-                "Obtain a key from https://aistudio.google.com and set GEMINI_API_KEY."
-            )
+        """Connect to MCP server. Initialize AI clients dynamically upon chat if needed."""
+        if self._connected:
+            return
 
         # Launch MCP server subprocess via stdio transport
         params = StdioServerParameters(command="python3", args=[self.server_script])
@@ -109,46 +110,123 @@ class DroneChatAgent:
         # Discover tools from MCP server
         listed = await self.session.list_tools()
         self.tools = listed.tools
+        self._connected = True
 
-        # Setup Gemini tool declarations and client
-        if SDK_FLAVOR == "google-genai":
-            self.client = genai.Client(api_key=api_key)
-            self.gemini_declarations = [
-                types.FunctionDeclaration(
-                    name=t.name,
-                    description=t.description or "",
-                    parameters_json_schema=_clean_schema(
-                        getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
-                    ),
-                )
+    def _init_clients(self):
+        """Initialize Groq or Gemini clients based on available API keys."""
+        groq_key = os.environ.get("GROQ_API_KEY")
+        gemini_key = os.environ.get("GEMINI_API_KEY")
+        
+        if not groq_key and not gemini_key:
+            raise RuntimeError("No API keys configured. Set GROQ_API_KEY or GEMINI_API_KEY.")
+
+        # Setup Groq
+        if groq_key and GROQ_AVAILABLE and not self.groq_client:
+            self.groq_client = AsyncGroq(api_key=groq_key)
+            self.groq_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "parameters": _clean_schema(
+                            getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
+                        ),
+                    }
+                }
                 for t in self.tools
             ]
-        elif SDK_FLAVOR == "google-generativeai":
-            genai_legacy.configure(api_key=api_key)
-            legacy_tools = [
-                {
-                    "function_declarations": [
-                        {
-                            "name": t.name,
-                            "description": t.description or "",
-                            "parameters": _clean_schema(
-                                getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
-                            ),
-                        }
-                        for t in self.tools
-                    ]
-                }
-            ]
-            legacy_model = genai_legacy.GenerativeModel(
-                model_name=self.model,
-                system_instruction=SYSTEM_PROMPT,
-                tools=legacy_tools,
+
+        # Setup Gemini
+        if gemini_key and SDK_FLAVOR and not self.gemini_client and not self._legacy_chat:
+            if SDK_FLAVOR == "google-genai":
+                self.gemini_client = genai.Client(api_key=gemini_key)
+                self.gemini_declarations = [
+                    types.FunctionDeclaration(
+                        name=t.name,
+                        description=t.description or "",
+                        parameters_json_schema=_clean_schema(
+                            getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
+                        ),
+                    )
+                    for t in self.tools
+                ]
+            elif SDK_FLAVOR == "google-generativeai":
+                genai_legacy.configure(api_key=gemini_key)
+                legacy_tools = [
+                    {
+                        "function_declarations": [
+                            {
+                                "name": t.name,
+                                "description": t.description or "",
+                                "parameters": _clean_schema(
+                                    getattr(t, "input_schema", None) or getattr(t, "inputSchema", {})
+                                ),
+                            }
+                            for t in self.tools
+                        ]
+                    }
+                ]
+                legacy_model = genai_legacy.GenerativeModel(
+                    model_name=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+                    system_instruction=SYSTEM_PROMPT,
+                    tools=legacy_tools,
+                )
+                self._legacy_chat = legacy_model.start_chat(history=[])
+
+    async def _chat_groq(self, user_message: str) -> str:
+        """Process chat message using Groq."""
+        self.groq_history.append({"role": "user", "content": user_message})
+        
+        while True:
+            response = await self.groq_client.chat.completions.create(
+                model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                messages=self.groq_history,
+                tools=self.groq_tools,
+                tool_choice="auto",
+                temperature=0.2,
             )
-            self._legacy_chat = legacy_model.start_chat(history=[])
+            
+            response_message = response.choices[0].message
+            
+            # Groq returns tool_calls or text content
+            if response_message.tool_calls:
+                # Add assistant message with tool calls to history
+                self.groq_history.append(response_message.model_dump())
+                
+                for tool_call in response_message.tool_calls:
+                    call_name = tool_call.function.name
+                    try:
+                        call_args = json.loads(tool_call.function.arguments)
+                    except Exception:
+                        call_args = {}
+                    
+                    try:
+                        try:
+                            result = await self.session.call_tool(call_name, arguments=call_args)
+                        except TypeError:
+                            result = await self.session.call_tool(call_name, call_args)
+
+                        text_result = "\n".join(
+                            part.text for part in result.content if hasattr(part, "text")
+                        )
+                    except Exception as err:
+                        text_result = f"Error executing tool '{call_name}': {err}"
+
+                    # Add tool response to history
+                    self.groq_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": call_name,
+                        "content": text_result
+                    })
+            else:
+                self.groq_history.append({"role": "assistant", "content": response_message.content})
+                return response_message.content or "(no text response)"
 
     async def _chat_genai(self, user_message: str) -> str:
         """Process chat message using google-genai SDK."""
-        self.history.append(
+        self.gemini_history.append(
             types.Content(
                 role="user",
                 parts=[types.Part.from_text(text=user_message)]
@@ -164,9 +242,9 @@ class DroneChatAgent:
                 temperature=0.2,
             )
 
-            response = await self.client.aio.models.generate_content(
-                model=self.model,
-                contents=self.history,
+            response = await self.gemini_client.aio.models.generate_content(
+                model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=self.gemini_history,
                 config=config,
             )
 
@@ -175,15 +253,13 @@ class DroneChatAgent:
 
             candidate = response.candidates[0]
             if candidate.content:
-                self.history.append(candidate.content)
+                self.gemini_history.append(candidate.content)
 
-            # Collect any text response parts
             if candidate.content and candidate.content.parts:
                 for part in candidate.content.parts:
                     if getattr(part, "text", None):
                         reply_parts.append(part.text)
 
-            # Detect function calls
             function_calls = getattr(response, "function_calls", None)
             if not function_calls and candidate.content and candidate.content.parts:
                 function_calls = [
@@ -194,7 +270,6 @@ class DroneChatAgent:
             if not function_calls:
                 break
 
-            # Execute tool calls via MCP session
             tool_response_parts = []
             for call in function_calls:
                 call_name = call.name
@@ -218,7 +293,7 @@ class DroneChatAgent:
                     )
                 )
 
-            self.history.append(
+            self.gemini_history.append(
                 types.Content(
                     role="tool",
                     parts=tool_response_parts,
@@ -233,14 +308,12 @@ class DroneChatAgent:
         response = await self._legacy_chat.send_message_async(user_message)
 
         while True:
-            # Check text
             try:
                 if response.text:
                     reply_parts.append(response.text)
             except Exception:
                 pass
 
-            # Detect function calls
             function_calls = []
             if response.candidates:
                 for part in response.candidates[0].content.parts:
@@ -250,7 +323,6 @@ class DroneChatAgent:
             if not function_calls:
                 break
 
-            # Execute each function call and send response back
             for call in function_calls:
                 call_name = call.name
                 call_args = dict(call.args) if call.args else {}
@@ -276,13 +348,29 @@ class DroneChatAgent:
         return "\n\n".join(reply_parts).strip() or "(no text response)"
 
     async def chat(self, user_message: str) -> str:
-        """Send a user message to the Gemini agent and execute any requested drone tools."""
-        if SDK_FLAVOR == "google-genai":
+        """Send a user message and execute drone tools. Tries Groq first, falls back to Gemini."""
+        if not self._connected:
+            await self.connect()
+            
+        self._init_clients()
+        
+        # Try Groq if configured
+        if self.groq_client:
+            try:
+                return await self._chat_groq(user_message)
+            except Exception as e:
+                # If Groq fails and Gemini is not configured, re-raise
+                if not (self.gemini_client or self._legacy_chat):
+                    raise
+                print(f"Groq API failed: {e}. Falling back to Gemini...")
+                
+        # Fallback to Gemini
+        if self.gemini_client:
             return await self._chat_genai(user_message)
-        elif SDK_FLAVOR == "google-generativeai":
+        elif self._legacy_chat:
             return await self._chat_legacy(user_message)
-        else:
-            raise RuntimeError("Neither 'google-genai' nor 'google-generativeai' is available.")
+            
+        raise RuntimeError("No AI client could handle the request.")
 
     async def close(self):
         """Close MCP session and subprocess."""

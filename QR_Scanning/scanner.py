@@ -6,9 +6,9 @@ import datetime
 import os
 import urllib.request
 from flask import Flask, jsonify, Response
-from pyngrok import ngrok
 import logging
 import numpy as np
+import sys
 
 # ============================================================
 # CONFIGURATION
@@ -619,9 +619,16 @@ def main():
 
     decoder_thread.start()
 
-    cap = cv2.VideoCapture(
-        CAMERA_INDEX, cv2.CAP_DSHOW
-    )
+    # Use platform-appropriate camera backend
+    if sys.platform == "win32":
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # Windows: DirectShow
+    else:
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)   # Linux/RPi: V4L2
+
+    # If the specific backend fails, fall back to auto-detect
+    if not cap.isOpened():
+        print("[WARN] Specific backend failed, trying auto-detect...")
+        cap = cv2.VideoCapture(CAMERA_INDEX)
 
     if not cap.isOpened():
 

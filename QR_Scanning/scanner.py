@@ -587,23 +587,14 @@ def start_web_server():
 
     port = 5001
 
-    # Start Flask in a background thread so it binds to the port first
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True),
-        daemon=True
+    print(f"\nQR Scanner running locally on http://0.0.0.0:{port}\n")
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        use_reloader=False,
+        threaded=True
     )
-    flask_thread.start()
-
-    # Wait for Flask to finish binding before ngrok tries to connect
-    time.sleep(2)
-
-    public_url = ngrok.connect(port).public_url
-
-    print(
-        f"\nNGROK: {public_url}\n"
-    )
-
-    flask_thread.join()
 
 
 # ============================================================

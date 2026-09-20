@@ -89,6 +89,7 @@ CHAT_PAGE = """
 </head>
 <body>
   <h3 style="color: #00ff00; margin-top: 0;">Drone Control Chat</h3>
+  <img id="video-feed" alt="Camera Feed Loading..." style="width: 100%; max-height: 400px; object-fit: cover; border-radius: 8px; margin-bottom: 12px; border: 1px solid #333; background: #000;" />
   <div id="log"></div>
   <form id="form">
     <input id="input" autocomplete="off" placeholder="e.g. connect and takeoff to 10m" />
@@ -98,6 +99,10 @@ CHAT_PAGE = """
     const log = document.getElementById('log');
     const form = document.getElementById('form');
     const input = document.getElementById('input');
+    const videoFeed = document.getElementById('video-feed');
+
+    // Dynamically point to the scanner.py feed on port 5001
+    videoFeed.src = window.location.protocol + "//" + window.location.hostname + ":5001/video_feed";
 
     function addMsg(text, cls) {
       const div = document.createElement('div');

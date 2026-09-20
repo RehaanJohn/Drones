@@ -2,3 +2,4 @@ opencv-contrib-python>=4.10.0
 Flask>=3.0.0
 pyngrok>=7.0.0
 numpy>=1.26.0
+flask-cors>=4.0.0

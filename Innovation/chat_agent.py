@@ -4,6 +4,7 @@ the AI tool-use loop (Groq or Gemini) so a plain chat message can trigger drone 
 """
 import asyncio
 import os
+import sys
 import json
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List
@@ -102,7 +103,7 @@ class DroneChatAgent:
             return
 
         # Launch MCP server subprocess via stdio transport
-        params = StdioServerParameters(command="python3", args=[self.server_script])
+        params = StdioServerParameters(command=sys.executable, args=[self.server_script])
         stdio, write = await self.exit_stack.enter_async_context(stdio_client(params))
         self.session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
         await self.session.initialize()

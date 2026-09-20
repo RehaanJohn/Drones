@@ -5,9 +5,10 @@ import time
 import datetime
 import os
 import urllib.request
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response
 from pyngrok import ngrok
 import logging
+import numpy as np
 
 # ============================================================
 # CONFIGURATION
@@ -80,6 +81,10 @@ last_scan_time = 0
 last_qr_points = None
 points_lock = threading.Lock()
 
+# Streaming state
+latest_jpeg = b""
+jpeg_lock = threading.Lock()
+
 
 # ============================================================
 # MODEL DOWNLOAD
@@ -112,12 +117,16 @@ def ensure_models_exist():
 
 def create_detector():
 
-    detector = cv2.wechat_qrcode.WeChatQRCode(
-        os.path.join(MODEL_DIR, "detect.prototxt"),
-        os.path.join(MODEL_DIR, "detect.caffemodel"),
-        os.path.join(MODEL_DIR, "sr.prototxt"),
-        os.path.join(MODEL_DIR, "sr.caffemodel"),
-    )
+    try:
+        detector = cv2.wechat_qrcode.WeChatQRCode(
+            os.path.join(MODEL_DIR, "detect.prototxt"),
+            os.path.join(MODEL_DIR, "detect.caffemodel"),
+            os.path.join(MODEL_DIR, "sr.prototxt"),
+            os.path.join(MODEL_DIR, "sr.caffemodel"),
+        )
+    except TypeError:
+        # For newer OpenCV versions (>= 5.0) where the API changed
+        detector = cv2.wechat_qrcode.WeChatQRCode()
 
     # Critical for distant QR detection.
     detector.setScaleFactor(DETECT_SCALE)
@@ -399,20 +408,10 @@ def configure_camera(cap):
         cv2.VideoWriter_fourcc(*"MJPG")
     )
 
-    cap.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        FRAME_WIDTH
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        FRAME_HEIGHT
-    )
-
-    cap.set(
-        cv2.CAP_PROP_FPS,
-        CAMERA_FPS
-    )
+    # Note: Forcing unsupported resolutions/FPS causes some Windows camera drivers to hang indefinitely.
+    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    # cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
     # Request minimum buffering.
     cap.set(
@@ -432,6 +431,9 @@ def configure_camera(cap):
 # ============================================================
 
 app = Flask(__name__)
+
+from flask_cors import CORS
+CORS(app) # Allow cross-origin requests from the chat app on port 5000
 
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
@@ -533,6 +535,8 @@ def dashboard():
     <body>
 
         <h2>Drone QR Telemetry Feed</h2>
+        
+        <img src="/video_feed" alt="Video Feed Loading..." style="width: 100%; max-width: 800px; border-radius: 8px; border: 2px solid #333; margin-bottom: 20px;" />
 
         <div id="scans"></div>
 
@@ -552,23 +556,54 @@ def get_scans():
         )
 
 
+def gen_frames():
+    frame_count = 0
+    while True:
+        with jpeg_lock:
+            frame = latest_jpeg
+        if frame:
+            frame_count += 1
+            if frame_count == 1:
+                print(f"[STREAM] First frame yielded to browser ({len(frame)} bytes)")
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.05) # ~20 FPS streaming
+
+@app.route("/video_feed")
+def video_feed():
+    print("[STREAM] /video_feed requested by browser")
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/test_frame")
+def test_frame():
+    """Returns a single JPEG frame for debugging — open localhost:5001/test_frame"""
+    with jpeg_lock:
+        frame = latest_jpeg
+    if frame:
+        return Response(frame, mimetype='image/jpeg')
+    return "No frame available yet", 503
+
 def start_web_server():
 
-    port = 5000
+    port = 5001
 
-    public_url = ngrok.connect(
-        port
-    ).public_url
+    # Start Flask in a background thread so it binds to the port first
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True),
+        daemon=True
+    )
+    flask_thread.start()
+
+    # Wait for Flask to finish binding before ngrok tries to connect
+    time.sleep(2)
+
+    public_url = ngrok.connect(port).public_url
 
     print(
         f"\nNGROK: {public_url}\n"
     )
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        use_reloader=False
-    )
+    flask_thread.join()
 
 
 # ============================================================
@@ -577,7 +612,7 @@ def start_web_server():
 
 def main():
 
-    global running
+    global running, latest_jpeg, last_scanned_text, last_scan_time, last_qr_points
 
     web_thread = threading.Thread(
         target=start_web_server,
@@ -594,8 +629,7 @@ def main():
     decoder_thread.start()
 
     cap = cv2.VideoCapture(
-        CAMERA_INDEX,
-        cv2.CAP_V4L2
+        CAMERA_INDEX, cv2.CAP_DSHOW
     )
 
     if not cap.isOpened():
@@ -604,7 +638,8 @@ def main():
             "Could not open camera"
         )
 
-    configure_camera(cap)
+    # Do NOT force any codec — use whatever native format the camera defaults to.
+    # Forcing MJPG causes -1.0 FPS and blank frames on cameras that don't support it.
 
     actual_w = int(
         cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -624,12 +659,33 @@ def main():
 
     try:
 
+        consecutive_failures = 0
+        first_frame = True
+
         while True:
 
             ret, frame = cap.read()
 
             if not ret:
+                consecutive_failures += 1
+                if consecutive_failures == 5:
+                    print(f"[ERROR] cap.read() is failing! Camera returned no frames after 5 tries.")
+                    print(f"[ERROR] The camera light may be on but the driver is not sending data.")
+                if consecutive_failures > 30:
+                    # Generate an error frame to show in the UI instead of hanging
+                    err_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(err_frame, "CAMERA ERROR: NO FRAMES", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    ret_jpg, jpeg = cv2.imencode('.jpg', err_frame)
+                    if ret_jpg:
+                        with jpeg_lock:
+                            latest_jpeg = jpeg.tobytes()
                 continue
+            
+            consecutive_failures = 0
+
+            if first_frame:
+                print(f"[OK] First frame received! Streaming active.")
+                first_frame = False
 
             # ------------------------------------------------
             # Latest-frame queue
@@ -706,13 +762,21 @@ def main():
                     3
                 )
 
-            cv2.imshow(
-                "Drone QR Scanner",
-                display
-            )
+            # ------------------------------------------------
+            # Encode for Web Stream
+            # ------------------------------------------------
+            ret_jpg, jpeg = cv2.imencode('.jpg', display)
+            if ret_jpg:
+                with jpeg_lock:
+                    latest_jpeg = jpeg.tobytes()
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            # cv2.imshow(
+            #     "Drone QR Scanner",
+            #     display
+            # )
+
+            # if cv2.waitKey(1) & 0xFF == ord("q"):
+            #     break
 
     except KeyboardInterrupt:
 

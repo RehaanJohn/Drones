@@ -1,5 +1,7 @@
-﻿.env
+.env
 __pycache__/
 *.pyc
 venv/
 wechat_models/
+qr_scans.jsonl
+wechat_models/*.part

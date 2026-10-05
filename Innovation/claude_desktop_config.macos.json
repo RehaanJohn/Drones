@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pixhawk": {
+      "command": "/Users/rehaanjohn/edop/Coding Projects/Drones/Drones/.venv/bin/python",
+      "args": [
+        "/Users/rehaanjohn/edop/Coding Projects/Drones/Drones/Innovation/server.py"
+      ],
+      "env": {
+        "DRONE_CONN": "udpin:0.0.0.0:14550",
+        "DRONE_BAUD": "115200"
+      }
+    }
+  }
+}

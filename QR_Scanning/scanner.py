@@ -1,42 +1,21 @@
-import cv2
-import threading
-import queue
-import time
+"""Terminal QR scanner: print scans and append UTF-8 JSON records to a file."""
+import argparse
 import datetime
-import os
-import urllib.request
-from flask import Flask, jsonify, Response
-import logging
-import numpy as np
+import json
+from pathlib import Path
 import sys
+import time
+import urllib.request
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+import cv2
 
-CAMERA_INDEX = 0
-
-FRAME_WIDTH = 1920
-FRAME_HEIGHT = 1080
-CAMERA_FPS = 30
-
-# QR detection frequency
-SCAN_INTERVAL = 0.10       # ~10 QR searches/sec
-
-# WeChat detector scaling
-# 1.0 = maximum, 0.5 = half-resolution
+SCAN_INTERVAL = 0.10
 DETECT_SCALE = 0.50
-
-# Extra area around detected QR
 ROI_PADDING = 0.25
-
-# Upscale factor for fallback decoding
 UPSCALE_FACTOR = 2.0
-
 COOLDOWN_SECONDS = 2.0
-MAX_HISTORY = 20
-
-MODEL_DIR = "wechat_models"
+MODEL_DIR = Path(__file__).resolve().parent / "wechat_models"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "qr_scans.jsonl"
 
 MODEL_FILES = {
     "detect.prototxt":
@@ -64,79 +43,29 @@ MODEL_FILES = {
         "sr.caffemodel",
 }
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-frame_queue = queue.Queue(maxsize=1)
-
-running = True
-
-scan_history = []
-history_lock = threading.Lock()
-
-last_scanned_text = ""
-last_scan_time = 0
-
-last_qr_points = None
-points_lock = threading.Lock()
-
-# Streaming state
-latest_jpeg = b""
-jpeg_lock = threading.Lock()
-
-
-# ============================================================
-# MODEL DOWNLOAD
-# ============================================================
-
 def ensure_models_exist():
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for filename, url in MODEL_FILES.items():
-
-        filepath = os.path.join(MODEL_DIR, filename)
-
-        if os.path.exists(filepath):
+        filepath = MODEL_DIR / filename
+        if filepath.exists():
             continue
+        print(f"Downloading {filename}...", flush=True)
+        temporary = filepath.with_suffix(filepath.suffix + ".part")
+        try:
+            urllib.request.urlretrieve(url, temporary)
+            temporary.replace(filepath)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-        print(f"Downloading {filename}...")
-
-        urllib.request.urlretrieve(
-            url,
-            filepath
-        )
-
-        print(f"Downloaded {filename}")
-
-
-# ============================================================
-# QR DECODER INITIALIZATION
-# ============================================================
 
 def create_detector():
-
-    try:
-        detector = cv2.wechat_qrcode.WeChatQRCode(
-            os.path.join(MODEL_DIR, "detect.prototxt"),
-            os.path.join(MODEL_DIR, "detect.caffemodel"),
-            os.path.join(MODEL_DIR, "sr.prototxt"),
-            os.path.join(MODEL_DIR, "sr.caffemodel"),
-        )
-    except TypeError:
-        # For newer OpenCV versions (>= 5.0) where the API changed
-        detector = cv2.wechat_qrcode.WeChatQRCode()
-
-    # Critical for distant QR detection.
+    ensure_models_exist()
+    detector = cv2.wechat_qrcode.WeChatQRCode(
+        *(str(MODEL_DIR / name) for name in MODEL_FILES)
+    )
     detector.setScaleFactor(DETECT_SCALE)
-
     return detector
 
-
-# ============================================================
-# IMAGE HELPERS
-# ============================================================
 
 def crop_qr_region(frame, points):
 
@@ -191,7 +120,7 @@ def preprocess_for_fallback(image):
     return enhanced
 
 
-def fallback_decode(detector, crop):
+def fallback_decode(crop):
 
     if crop is None:
         return None
@@ -238,564 +167,108 @@ def fallback_decode(detector, crop):
     return None
 
 
-# ============================================================
-# QR WORKER
-# ============================================================
+class ScanWriter:
+    """Keep payloads intact, flush each scan, and suppress repeats per payload."""
+    def __init__(self, stream, cooldown=COOLDOWN_SECONDS):
+        self.stream = stream
+        self.cooldown = cooldown
+        self.last_seen = {}
 
-def decode_worker():
-
-    global running
-    global last_scanned_text
-    global last_scan_time
-    global last_qr_points
-
-    ensure_models_exist()
-
-    print("Loading WeChat QR detector...")
-
-    detector = create_detector()
-
-    print("QR detector ready.")
-
-    next_scan_time = 0
-    last_payload = None
-
-    while running:
-
-        try:
-
-            frame = frame_queue.get(
-                timeout=0.1
-            )
-
-        except queue.Empty:
-
-            continue
-
+    def record(self, payload):
+        if not payload:
+            return False
         now = time.monotonic()
+        self.last_seen = {
+            text: seen for text, seen in self.last_seen.items()
+            if now - seen < self.cooldown
+        }
+        if payload in self.last_seen:
+            return False
+        record = {
+            "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "data": payload,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        self.stream.write(line + "\n")
+        self.stream.flush()
+        print(line, flush=True)
+        self.last_seen[payload] = now
+        return True
 
-        # Limit detector frequency
-        if now < next_scan_time:
-            continue
 
-        next_scan_time = now + SCAN_INTERVAL
-
-        # ----------------------------------------------------
-        # SEARCH STAGE
-        # ----------------------------------------------------
-
-        search_frame = frame
-
-        try:
-
-            results, points = detector.detectAndDecode(
-                search_frame
-            )
-
-        except Exception as e:
-
-            print("QR detector error:", e)
-
-            continue
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        if results:
-
-            for i, payload in enumerate(results):
-
-                if not payload:
-                    continue
-
-                timestamp = datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-
-                # Avoid duplicate logging
-                if (
-                    payload == last_payload
-                    and time.time() - last_scan_time
-                    < COOLDOWN_SECONDS
-                ):
-                    continue
-
-                print()
-                print("======================================")
-                print("QR CODE DETECTED")
-                print("TIME:", timestamp)
-                print("DATA:", payload)
-                print("======================================")
-
-                last_scanned_text = payload
-                last_scan_time = time.time()
-
-                with history_lock:
-
-                    scan_history.append({
-                        "time": timestamp,
-                        "data": payload
-                    })
-
-                    if len(scan_history) > MAX_HISTORY:
-                        scan_history.pop(0)
-
-                last_payload = payload
-
-                # Save points for visualization
-                with points_lock:
-
-                    if points is not None and len(points) > 0:
-                        last_qr_points = points[0]
-
+def scan_frame(detector, frame, writer):
+    results, points = detector.detectAndDecode(frame)
+    for payload in results:
+        writer.record(payload)
+    # Retry each region that the detector found but could not decode.
+    if points is not None:
+        for index, region in enumerate(points):
+            if index < len(results) and results[index]:
                 continue
-
-        # ----------------------------------------------------
-        # FALLBACK: detector found QR geometry but decode failed
-        # ----------------------------------------------------
-
-        if points is not None and len(points) > 0:
-
-            crop = crop_qr_region(
-                frame,
-                points
-            )
-
-            payload = fallback_decode(
-                detector,
-                crop
-            )
-
-            if payload:
-
-                timestamp = datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-
-                print()
-                print("======================================")
-                print("QR CODE RECOVERED")
-                print("TIME:", timestamp)
-                print("DATA:", payload)
-                print("======================================")
-
-                last_scanned_text = payload
-                last_scan_time = time.time()
-
-                with history_lock:
-
-                    scan_history.append({
-                        "time": timestamp,
-                        "data": payload
-                    })
-
-                    if len(scan_history) > MAX_HISTORY:
-                        scan_history.pop(0)
-
-                last_payload = payload
-
-
-# ============================================================
-# CAMERA
-# ============================================================
-
-def configure_camera(cap):
-
-    # MJPEG helps USB cameras avoid excessive raw USB bandwidth.
-    cap.set(
-        cv2.CAP_PROP_FOURCC,
-        cv2.VideoWriter_fourcc(*"MJPG")
-    )
-
-    # Note: Forcing unsupported resolutions/FPS causes some Windows camera drivers to hang indefinitely.
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    # cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-
-    # Request minimum buffering.
-    cap.set(
-        cv2.CAP_PROP_BUFFERSIZE,
-        1
-    )
-
-    # Attempt to enable autofocus.
-    cap.set(
-        cv2.CAP_PROP_AUTOFOCUS,
-        1
-    )
-
-
-# ============================================================
-# WEB SERVER
-# ============================================================
-
-app = Flask(__name__)
-
-from flask_cors import CORS
-CORS(app) # Allow cross-origin requests from the chat app on port 5000
-
-log = logging.getLogger("werkzeug")
-log.setLevel(logging.ERROR)
-
-
-@app.route("/")
-def dashboard():
-
-    return """
-    <!DOCTYPE html>
-
-    <html>
-
-    <head>
-
-        <title>Drone QR Telemetry</title>
-
-        <style>
-
-            body {
-                font-family: Arial;
-                padding: 20px;
-                background: #121212;
-                color: white;
-            }
-
-            .scan-item {
-                background: #1e1e1e;
-                padding: 15px;
-                margin: 10px 0;
-                border-left: 5px solid #00ff00;
-                border-radius: 4px;
-            }
-
-            .timestamp {
-                color: #888;
-                font-size: 0.8em;
-            }
-
-            .payload {
-                font-size: 1.2em;
-                font-weight: bold;
-                margin-top: 5px;
-                word-break: break-all;
-            }
-
-        </style>
-
-        <script>
-
-            async function fetchScans() {
-
-                try {
-
-                    const res =
-                        await fetch('/api/scans');
-
-                    const data =
-                        await res.json();
-
-                    const container =
-                        document.getElementById('scans');
-
-                    container.innerHTML =
-                        data.map(scan => `
-
-                            <div class="scan-item">
-
-                                <div class="timestamp">
-                                    ${scan.time}
-                                </div>
-
-                                <div class="payload">
-                                    ${scan.data}
-                                </div>
-
-                            </div>
-
-                        `).join('');
-
-                }
-
-                catch (e) {
-
-                    console.error(e);
-
-                }
-
-            }
-
-            setInterval(fetchScans, 1000);
-
-            window.onload = fetchScans;
-
-        </script>
-
-    </head>
-
-    <body>
-
-        <h2>Drone QR Telemetry Feed</h2>
-        
-        <img src="/video_feed" alt="Video Feed Loading..." style="width: 100%; max-width: 800px; border-radius: 8px; border: 2px solid #333; margin-bottom: 20px;" />
-
-        <div id="scans"></div>
-
-    </body>
-
-    </html>
-    """
-
-
-@app.route("/api/scans")
-def get_scans():
-
-    with history_lock:
-
-        return jsonify(
-            list(reversed(scan_history))
-        )
-
-
-def gen_frames():
-    frame_count = 0
-    while True:
-        with jpeg_lock:
-            frame = latest_jpeg
-        if frame:
-            frame_count += 1
-            if frame_count == 1:
-                print(f"[STREAM] First frame yielded to browser ({len(frame)} bytes)")
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.05) # ~20 FPS streaming
-
-@app.route("/video_feed")
-def video_feed():
-    print("[STREAM] /video_feed requested by browser")
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route("/test_frame")
-def test_frame():
-    """Returns a single JPEG frame for debugging — open localhost:5001/test_frame"""
-    with jpeg_lock:
-        frame = latest_jpeg
-    if frame:
-        return Response(frame, mimetype='image/jpeg')
-    return "No frame available yet", 503
-
-def start_web_server():
-
-    port = 5001
-
-    print(f"\nQR Scanner running locally on http://0.0.0.0:{port}\n")
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        use_reloader=False,
-        threaded=True
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    global running, latest_jpeg, last_scanned_text, last_scan_time, last_qr_points
-
-    web_thread = threading.Thread(
-        target=start_web_server,
-        daemon=True
-    )
-
-    web_thread.start()
-
-    decoder_thread = threading.Thread(
-        target=decode_worker,
-        daemon=True
-    )
-
-    decoder_thread.start()
-
-    # Use platform-appropriate camera backend
-    if sys.platform == "win32":
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # Windows: DirectShow
-    else:
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)   # Linux/RPi: V4L2
-
-    # If the specific backend fails, fall back to auto-detect
+            crop = crop_qr_region(frame, [region])
+            payload = fallback_decode(crop)
+            writer.record(payload)
+
+
+def open_camera(index):
+    backend = {
+        "darwin": cv2.CAP_AVFOUNDATION,
+        "win32": cv2.CAP_DSHOW,
+    }.get(sys.platform, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(index, backend)
     if not cap.isOpened():
-        print("[WARN] Specific backend failed, trying auto-detect...")
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-
-    if not cap.isOpened():
-
-        raise RuntimeError(
-            "Could not open camera"
-        )
-
-    # Do NOT force any codec — use whatever native format the camera defaults to.
-    # Forcing MJPG causes -1.0 FPS and blank frames on cameras that don't support it.
-
-    actual_w = int(
-        cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    )
-
-    actual_h = int(
-        cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    )
-
-    actual_fps = cap.get(
-        cv2.CAP_PROP_FPS
-    )
-
-    print(
-        f"Camera: {actual_w}x{actual_h} @ {actual_fps} FPS"
-    )
-
-    try:
-
-        consecutive_failures = 0
-        first_frame = True
-
-        while True:
-
-            ret, frame = cap.read()
-
-            if not ret:
-                consecutive_failures += 1
-                if consecutive_failures == 5:
-                    print(f"[ERROR] cap.read() is failing! Camera returned no frames after 5 tries.")
-                    print(f"[ERROR] The camera light may be on but the driver is not sending data.")
-                if consecutive_failures > 30:
-                    # Generate an error frame to show in the UI instead of hanging
-                    err_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(err_frame, "CAMERA ERROR: NO FRAMES", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    ret_jpg, jpeg = cv2.imencode('.jpg', err_frame)
-                    if ret_jpg:
-                        with jpeg_lock:
-                            latest_jpeg = jpeg.tobytes()
-                continue
-            
-            consecutive_failures = 0
-
-            if first_frame:
-                print(f"[OK] First frame received! Streaming active.")
-                first_frame = False
-
-            # ------------------------------------------------
-            # Latest-frame queue
-            # ------------------------------------------------
-
-            if frame_queue.full():
-
-                try:
-                    frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-
-            frame_queue.put_nowait(frame)
-
-            # ------------------------------------------------
-            # Preview
-            # ------------------------------------------------
-
-            display = frame.copy()
-
-            if last_scanned_text:
-
-                age = time.time() - last_scan_time
-
-                if age < 2:
-
-                    cv2.rectangle(
-                        display,
-                        (0, 0),
-                        (display.shape[1], 80),
-                        (0, 255, 0),
-                        -1
-                    )
-
-                    cv2.putText(
-                        display,
-                        f"QR: {last_scanned_text}",
-                        (30, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 0, 0),
-                        3
-                    )
-
-            else:
-
-                cv2.putText(
-                    display,
-                    "SEARCHING FOR QR...",
-                    (30, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 255, 255),
-                    2
-                )
-
-            # ------------------------------------------------
-            # Show QR bounding box
-            # ------------------------------------------------
-
-            with points_lock:
-
-                points = last_qr_points
-
-            if points is not None:
-
-                pts = points.astype(int)
-
-                cv2.polylines(
-                    display,
-                    [pts],
-                    True,
-                    (0, 255, 0),
-                    3
-                )
-
-            # ------------------------------------------------
-            # Encode for Web Stream
-            # ------------------------------------------------
-            ret_jpg, jpeg = cv2.imencode('.jpg', display)
-            if ret_jpg:
-                with jpeg_lock:
-                    latest_jpeg = jpeg.tobytes()
-
-            # cv2.imshow(
-            #     "Drone QR Scanner",
-            #     display
-            # )
-
-            # if cv2.waitKey(1) & 0xFF == ord("q"):
-            #     break
-
-    except KeyboardInterrupt:
-
-        pass
-
-    finally:
-
-        print("\nShutting down...")
-
-        running = False
-
         cap.release()
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(
+            f"Could not open camera {index}. On macOS, allow camera access "
+            "for your terminal in System Settings > Privacy & Security > Camera."
+        )
+    return cap
 
-        cv2.destroyAllWindows()
 
-        try:
-            ngrok.kill()
-        except:
-            pass
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
+                        help="Append-only JSON Lines scan file")
+    args = parser.parse_args(argv)
+    cap = None
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("a", encoding="utf-8") as stream:
+            detector = create_detector()
+            cap = open_camera(args.camera)
+            writer = ScanWriter(stream)
+            print(f"Scanning camera {args.camera}. Results: {args.output.resolve()}", flush=True)
+            print("Press Ctrl+C to stop.", flush=True)
+            failures = 0
+            next_scan = 0.0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    failures += 1
+                    if failures >= 30:
+                        raise RuntimeError("Camera returned no frames after 30 attempts.")
+                    time.sleep(SCAN_INTERVAL)
+                    continue
+                failures = 0
+                now = time.monotonic()
+                if now < next_scan:
+                    continue
+                next_scan = now + SCAN_INTERVAL
+                scan_frame(detector, frame, writer)
+    except KeyboardInterrupt:
+        print("\nScanner stopped.", flush=True)
+        return 0
+    except (OSError, RuntimeError, cv2.error) as exc:
+        print(f"Scanner error: {exc}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if cap is not None:
+            cap.release()
 
 
 if __name__ == "__main__":
-
-    main()
+    sys.exit(main())

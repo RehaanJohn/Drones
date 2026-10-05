@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pixhawk": {
+      "command": "/usr/bin/ssh",
+      "args": [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "<pi-user>@<pi-tailscale-hostname>",
+        "/home/<pi-user>/Drones/.venv/bin/python /home/<pi-user>/Drones/Innovation/server.py"
+      ]
+    }
+  }
+}

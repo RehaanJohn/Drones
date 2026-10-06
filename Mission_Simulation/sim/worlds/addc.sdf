@@ -1,0 +1,81 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <world name="addc">
+    <physics name="default" type="ignored">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <gravity>0 0 -9.80665</gravity>
+    <plugin filename="ignition-gazebo-physics-system" name="ignition::gazebo::systems::Physics" />
+    <plugin filename="ignition-gazebo-user-commands-system" name="ignition::gazebo::systems::UserCommands" />
+    <plugin filename="ignition-gazebo-scene-broadcaster-system" name="ignition::gazebo::systems::SceneBroadcaster" />
+    <plugin filename="ignition-gazebo-imu-system" name="ignition::gazebo::systems::Imu" />
+    <plugin filename="ignition-gazebo-air-pressure-system" name="ignition::gazebo::systems::AirPressure" />
+    <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <light name="sun" type="directional">
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+      <cast_shadows>true</cast_shadows>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+      </attenuation>
+    </light>
+    <model name="ground">
+      <static>true</static>
+      <link name="ground">
+        <visual name="field">
+          <pose>20 0 -0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>120 100 0.1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.22 0.34 0.18 1</ambient>
+            <diffuse>0.22 0.34 0.18 1</diffuse>
+          </material>
+        </visual>
+        <collision name="field_collision">
+          <pose>20 0 -0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>120 100 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+    <model name="home_zone">
+      <static>true</static>
+      <link name="marker">
+        <visual name="home">
+          <pose>0 0 0.003 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>2 2 0.005</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.15 0.3 0.7 1</ambient>
+            <diffuse>0.15 0.3 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+    <include>
+      <uri>model://intelligence_cache</uri>
+      <pose>12 3 0 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://addc_quad</uri>
+      <name>addc_quad_0</name>
+      <pose>0 0 0.24 0 0 0</pose>
+    </include>
+  </world>
+</sdf>

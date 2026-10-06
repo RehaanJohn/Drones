@@ -1,0 +1,61 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <model name="intelligence_cache">
+    <static>true</static>
+    <link name="cache">
+      <visual name="container">
+        <pose>0 0 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.65 0.5 0.6</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0.25 0.04 1</ambient>
+          <diffuse>1 0.25 0.04 1</diffuse>
+        </material>
+      </visual>
+      <collision name="container_collision">
+        <pose>0 0 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.65 0.5 0.6</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="a3_sheet">
+        <pose>0 0 0.602 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.420 0.297 0.002</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+        </material>
+      </visual>
+      <visual name="qr">
+        <pose>0 0 0.604 0 0 0</pose>
+        <cast_shadows>false</cast_shadows>
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>0.25 0.25</size>
+          </plane>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+          <pbr>
+            <metal>
+              <albedo_map>model://intelligence_cache/materials/textures/qr.png</albedo_map>
+              <metalness>0</metalness>
+              <roughness>1</roughness>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

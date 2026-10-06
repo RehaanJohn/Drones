@@ -1,0 +1,44 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+    bounds: [-3.0, 50.0, -18.0, 18.0]
+    search_height: 6.0
+    minimum_height: 2.0
+    maximum_height: 12.0
+    scan_rate: 0.5
+    approach_lookahead: 1.0
+    position_tolerance: 0.5
+    confirmation_count: 3
+    target_max_age: 2.0
+    telemetry_max_age: 1.0
+    candidate_radius: 3.0
+    maximum_uncertainty: 5.0
+    handoff_timeout: 20.0
+    approach_timeout: 60.0
+    scan_timeout: 30.0
+    mission_timeout: 180.0
+    prime_duration: 2.0
+    arm_timeout: 15.0
+    landing_timeout: 45.0
+    descent_rate: 0.3
+    viewpoint_spacing: 12.0
+    decode_confirmation_count: 3
+    payload_length: 2
+    discovery_mode: color
+    max_processing_hz: 5.0
+    maximum_image_age: 0.8
+    minimum_discovery_area: 80.0
+    maximum_projection_range: 80.0
+    maximum_observation_age: 0.8
+    # MAVROS local origin is established at the resting vehicle, ~0.24 m above ground.
+    ground_z: -0.24
+    cache_top_height: 0.6
+    discovery_mount: [0.20, 0.0, -0.05]
+    down_mount: [0.0, 0.0, -0.10]
+    discovery_tilt_deg: 25.0
+    camera_width: 1920
+    camera_height: 1080
+    camera_hfov_deg: 60.0
+    camera_fps: 15.0
+    evidence_directory: /tmp/addc-evidence
+    result_file: /tmp/addc-evidence/results.jsonl

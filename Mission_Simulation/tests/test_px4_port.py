@@ -41,3 +41,29 @@ class PortGuardTests(unittest.TestCase):
                 port.patch(root)
             self.assertEqual(file.read_text(), 'unsupported version\n')
             self.assertFalse(file.with_name(file.name+'.addc-original').exists())
+
+    def test_upgrade_legacy_cmake_preserves_original_and_rejects_edits(self):
+        original = b'# Find the gz_Transport library\nold lookup\n\tpx4_add_module(placeholder)\nendif()\n'
+        hashes = {'CMakeLists.txt': hashlib.sha256(original).hexdigest()}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(port.HASHES, hashes, clear=True):
+            root = Path(directory)
+            file = root/'src/modules/simulation/gz_bridge/CMakeLists.txt'
+            file.parent.mkdir(parents=True)
+            backup = file.with_name(file.name+'.addc-original')
+            backup.write_bytes(original)
+            corrected = port.transform('CMakeLists.txt', original.decode()).encode()
+            legacy = corrected.replace(b'find_package(ignition-transport11 REQUIRED)',
+                                       b'find_package(ignition-transport11 REQUIRED COMPONENTS core)')
+            self.assertNotEqual(legacy, corrected)
+            file.write_bytes(legacy)
+            port.patch(root, check=True)
+            self.assertEqual(file.read_bytes(), legacy)
+            port.patch(root)
+            self.assertEqual(file.read_bytes(), corrected)
+            self.assertEqual(backup.read_bytes(), original)
+            port.patch(root)
+            self.assertEqual(file.read_bytes(), corrected)
+            file.write_bytes(legacy + b'# User edit\n')
+            with self.assertRaises(ValueError):
+                port.patch(root)
+            self.assertEqual(file.read_bytes(), legacy + b'# User edit\n')

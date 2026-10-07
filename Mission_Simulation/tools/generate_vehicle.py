@@ -32,6 +32,13 @@ def generate(output, width=1920, height=1080, tilt_deg=25.0, hfov_deg=60.0, fps=
         sensor = child(base, 'sensor', name=name, type=kind)
         child(sensor, 'always_on', 'true')
         child(sensor, 'update_rate', rate)
+        if kind == 'air_pressure':
+            # Match PX4 v1.14.4 x500: constant noiseless pressure at rest
+            # triggers PX4's repeated-value (STALE) sensor check.
+            pressure = child(child(sensor, 'air_pressure'), 'pressure')
+            noise = child(pressure, 'noise', type='gaussian')
+            child(noise, 'mean', 0)
+            child(noise, 'stddev', 0.01)
     for name, mount, tilt in [('discovery', discovery_mount, math.radians(tilt_deg)),
                               ('down', down_mount, math.pi/2)]:
         sensor = child(base, 'sensor', name=f'{name}_camera', type='camera')
@@ -57,7 +64,9 @@ def generate(output, width=1920, height=1080, tilt_deg=25.0, hfov_deg=60.0, fps=
         inertial = child(rotor, 'inertial')
         child(inertial, 'mass', '0.016')
         inertia = child(inertial, 'inertia')
-        for tag, value in [('ixx', 3.85e-7), ('iyy', 2.61e-5), ('izz', 2.65e-5)]:
+        # Principal moments must satisfy Izz <= Ixx + Iyy.
+        # The previous rounded Izz (2.65e-5) exceeded that sum.
+        for tag, value in [('ixx', 3.85e-7), ('iyy', 2.61e-5), ('izz', 2.64e-5)]:
             child(inertia, tag, value)
         box(rotor, 'propeller', '0.28 0.015 0.003', '0 0 0 0 0 0', '0.1 0.1 0.1 1', False)
         joint = child(model, 'joint', name=f'rotor_{i}_joint', type='revolute')

@@ -6,7 +6,8 @@ if [[ $# -ne 1 ]]; then
 fi
 addc_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 px4_root="$(cd -- "$1" && pwd)"
-if ! ign topic -l | rg -q '^/world/addc/clock$'; then
+# Read the full stream to avoid an early-exit SIGPIPE under pipefail.
+if ! ign topic -l | grep -Fx '/world/addc/clock' >/dev/null; then
   echo "Start the ADDC Fortress world first with tools/run_gazebo.sh" >&2
   exit 1
 fi

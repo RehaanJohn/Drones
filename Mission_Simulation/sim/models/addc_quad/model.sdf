@@ -122,6 +122,14 @@
       <sensor name="air_pressure_sensor" type="air_pressure">
         <always_on>true</always_on>
         <update_rate>50</update_rate>
+        <air_pressure>
+          <pressure>
+            <noise type="gaussian">
+              <mean>0</mean>
+              <stddev>0.01</stddev>
+            </noise>
+          </pressure>
+        </air_pressure>
       </sensor>
       <sensor name="discovery_camera" type="camera">
         <pose>0.2 0.0 -0.05 0 0.4363323129985824 0</pose>
@@ -171,7 +179,7 @@
         <inertia>
           <ixx>3.85e-07</ixx>
           <iyy>2.61e-05</iyy>
-          <izz>2.65e-05</izz>
+          <izz>2.64e-05</izz>
         </inertia>
       </inertial>
       <visual name="propeller">
@@ -222,7 +230,7 @@
         <inertia>
           <ixx>3.85e-07</ixx>
           <iyy>2.61e-05</iyy>
-          <izz>2.65e-05</izz>
+          <izz>2.64e-05</izz>
         </inertia>
       </inertial>
       <visual name="propeller">
@@ -273,7 +281,7 @@
         <inertia>
           <ixx>3.85e-07</ixx>
           <iyy>2.61e-05</iyy>
-          <izz>2.65e-05</izz>
+          <izz>2.64e-05</izz>
         </inertia>
       </inertial>
       <visual name="propeller">
@@ -324,7 +332,7 @@
         <inertia>
           <ixx>3.85e-07</ixx>
           <iyy>2.61e-05</iyy>
-          <izz>2.65e-05</izz>
+          <izz>2.64e-05</izz>
         </inertia>
       </inertial>
       <visual name="propeller">

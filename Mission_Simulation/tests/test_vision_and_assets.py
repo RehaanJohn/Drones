@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 import xml.etree.ElementTree as ET
 import cv2
@@ -40,3 +42,39 @@ class VisionTests(unittest.TestCase):
         self.assertEqual({s.find('camera/optical_frame_id').text for s in cameras},
                          {'discovery_camera_optical', 'down_camera_optical'})
         self.assertEqual(len(model.findall('.//plugin')), 4)
+
+    def test_saved_and_generated_vehicle_inertias_are_physical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([sys.executable, str(ROOT/'tools/generate_vehicle.py'),
+                            '--output', directory], check=True)
+            for path in (ROOT/'sim/models/addc_quad/model.sdf',
+                         Path(directory)/'models/addc_quad/model.sdf'):
+                for link in ET.parse(path).findall('.//link'):
+                    with self.subTest(model=str(path), link=link.get('name')):
+                        inertial = link.find('inertial')
+                        self.assertGreater(float(inertial.findtext('mass')), 0)
+                        inertia = inertial.find('inertia')
+                        values = {tag: float(inertia.findtext(tag, '0'))
+                                  for tag in ('ixx', 'iyy', 'izz', 'ixy', 'ixz', 'iyz')}
+                        matrix = np.array([
+                            [values['ixx'], values['ixy'], values['ixz']],
+                            [values['ixy'], values['iyy'], values['iyz']],
+                            [values['ixz'], values['iyz'], values['izz']]])
+                        moments = np.linalg.eigvalsh(matrix)
+                        self.assertTrue(np.all(np.isfinite(moments)))
+                        self.assertGreater(moments[0], 0)
+                        self.assertLessEqual(moments[2], moments[0] + moments[1])
+
+    def test_saved_and_generated_barometer_has_pressure_noise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([sys.executable, str(ROOT/'tools/generate_vehicle.py'),
+                            '--output', directory], check=True)
+            for path in (ROOT/'sim/models/addc_quad/model.sdf',
+                         Path(directory)/'models/addc_quad/model.sdf'):
+                with self.subTest(model=str(path)):
+                    sensor = ET.parse(path).find('.//sensor[@name="air_pressure_sensor"]')
+                    noise = sensor.find('air_pressure/pressure/noise')
+                    self.assertIsNotNone(noise)
+                    self.assertEqual(noise.get('type'), 'gaussian')
+                    self.assertEqual(float(noise.findtext('mean')), 0)
+                    self.assertGreater(float(noise.findtext('stddev')), 0)

@@ -29,7 +29,7 @@ def transform(name, text):
         end = text.index('\n\tpx4_add_module(', start)
         # Explicitly name the versions installed by ignition-fortress on Jammy.
         replacement = '''# ADDC: Fortress transport11, msgs8, math6.
-find_package(ignition-transport11 REQUIRED COMPONENTS core)
+find_package(ignition-transport11 REQUIRED)
 find_package(ignition-msgs8 REQUIRED)
 find_package(ignition-math6 REQUIRED)
 if(ignition-transport11_FOUND)
@@ -66,7 +66,14 @@ def patch(root, check=False):
             raise ValueError(f'{relative}: source is not the supported pristine PX4 v1.14.4 file')
         modified = transform(name, original.decode()).encode()
         current = path.read_bytes()
-        if current not in (original, modified):
+        accepted = [original, modified]
+        if name == 'CMakeLists.txt':
+            # Upgrade only the exact output of the previous ADDC port.
+            # `core` is a link target alias, not a find_package component.
+            accepted.append(modified.replace(
+                b'find_package(ignition-transport11 REQUIRED)',
+                b'find_package(ignition-transport11 REQUIRED COMPONENTS core)'))
+        if current not in accepted:
             raise ValueError(f'{relative}: local modifications would be overwritten')
         changes.append((path, backup, original, modified))
     # Validate every file before touching any of them. Idempotent, backups retained.

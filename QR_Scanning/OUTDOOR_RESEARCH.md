@@ -1,5 +1,29 @@
 # Outdoor QR detection and the A3 / 10 m target
 
+## USB webcam implementation update
+
+The live scanner now targets Linux V4L2 USB webcams on Pi 4, with process-isolated
+capture, capability inspection, validated controls, tracked candidates, bounded
+workers and two-frame confirmation. The rolling five-variant pipeline described
+below is retained as `LegacyQRScanner` for comparisons. Current operation and field
+qualification commands are documented in [README.md](README.md).
+
+The tracked implementation retained **23/32 positive synthetic cases**, versus
+15/32 for the original half-scale WeChat baseline, with no decoded payload in the
+single negative clutter case. These are still-image results, not evidence of
+two-frame confirmation reliability or outdoor distance. The 10 m optical gate,
+timestamped recordings/replay, and binomial qualification reports are implemented
+in `qualification.py`. No Pi camera or independent daylight field trials were
+available for validation in this Windows implementation session.
+
+Current assumptions are existing URL-encoded codes, A3 paper, stable hover and
+daylight. Exact competition webcam, printed QR size, version and field of view
+must still be measured. Four native pixels/module is an engineering sampling
+margin, not a QR-standard guarantee. Camera read completion is not sensor exposure
+time; live latency must include capture/driver buffering.
+
+## Earlier investigation (historical)
+
 Research and local evaluation: 2026-10-11. Known setup: 1080p camera, QR printed
 on A3, desired reading distance at least 10 m. Camera model, horizontal field of
 view, printed QR width, payload/version, motion, and outdoor frames have not been

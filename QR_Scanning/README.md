@@ -1,174 +1,210 @@
-# Outdoor QR scanner
+# Outdoor USB webcam QR scanner
 
-Requests 1920x1080 capture, decodes native pixels with ZXing, and searches
-overlapping crops with WeChat and lighting corrections. Prints payloads and
-appends UTF-8 JSON Lines (`time`, `data`) to `QR_Scanning/qr_scans.jsonl`.
-Payloads, including newlines and Unicode, remain intact; repeats are suppressed
-per payload for two seconds. A live `cv2.imshow` preview opens by default.
-Press **Q**, **Esc**, close the window, or use Ctrl+C to stop. No server is needed.
-
-**A3 at 10 m requires checking the lens.** A 29.7 cm square including its border
-occupies only about 41 pixels at 10 m with 1080p and a 70-degree horizontal FOV.
-Read [the research, range calculations, and measured comparison](OUTDOOR_RESEARCH.md).
+Targets a 1080p USB webcam on Raspberry Pi 4, with Windows preview support.
+Uses native-resolution decoding, candidate tracking, quality-directed recovery
+and two-frame confirmation. **10 m / 99% within two seconds remains a field
+qualification target, not a measured capability.**
 
 ## Run
 
-From the repository root on Windows:
-
-```powershell
-.\venv\Scripts\python.exe -m pip install -r QR_Scanning/requirements.txt
-.\venv\Scripts\python.exe QR_Scanning/scanner.py
-```
-
-On Linux/macOS use your environment's `python` in place of
-`.\venv\Scripts\python.exe`. On Windows, startup discovers an RGB camera and
-verifies frame delivery in a child process with a five-second timeout per candidate.
-Stalled candidates are skipped; IR face-authentication devices are excluded by default.
-Use `--output path/to/scans.jsonl` to change the output. Models resolve relative to the script and download
-if missing. ZXing is recommended; an OpenCV-only fallback remains available.
-
-Select the Lenovo RGB camera by name instead of an index that may change when USB
-devices are reconnected:
+Windows development (preview enabled by default):
 
 ```powershell
 .\venv\Scripts\python.exe QR_Scanning/scanner.py --camera-name "Lenovo Performance RGB Camera"
 ```
 
-Use `--list-cameras` to list current indices per backend without opening the preview.
-`--camera INDEX` remains an explicit override and bypasses discovery. Do not reuse
-an old index after reconnecting: during troubleshooting the working Lenovo device
-changed from index 1 to index 0. Named discovery and 1920x1080 frame delivery were
-verified with the actual Lenovo camera. Linux/macOS retain index 0 as the default.
+Q, Esc or closing the window stops scanning. Orange outlines are provisional;
+green means the payload matches in two distinct captured frames. Preview is
+independent of decoding. Input frames retain native resolution. Windows camera
+discovery remains available through `--list-cameras`; indices can change after
+USB reconnection.
 
-The preview requires **opencv-contrib-python**, not a headless wheel. The current
-project environment has been migrated. If upgrading another environment that
-already has multiple OpenCV wheels, remove them first and reinstall requirements
-so the shared `cv2` files are not left conflicting:
+Raspberry Pi setup and headless competition mode:
 
-```powershell
-.\venv\Scripts\python.exe -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless
-.\venv\Scripts\python.exe -m pip install -r QR_Scanning/requirements.txt
+```bash
+sudo apt install v4l-utils
+python -m pip install -r QR_Scanning/requirements.txt
+python QR_Scanning/scanner.py --list-cameras
+python QR_Scanning/scanner.py --inspect-camera --device /dev/video0
+python QR_Scanning/scanner.py --competition --profile-dir QR_Scanning/camera_profiles
 ```
 
-The preview displays the raw camera frame in a resizable window, initially at
-most 1280 pixels wide. Decoder input stays at full capture resolution. Preview
-refresh follows scan speed. Use `--no-preview` when running without a display.
+Linux discovery prefers stable `/dev/v4l/by-id/` paths. Pin the actual RGB endpoint
+reported by discovery with `--device PATH`. An explicit `--camera 0` selects
+`/dev/video0`; raw node numbers may change after reconnection.
 
-## Terminal output and QR links
+V4L2 runs in a separate process: blocked open/read calls can be terminated after
+five seconds, with at most three restarts. Discovery can skip failed candidates;
+after selection, reconnects stay on that device. There is no CSI/Picamera2 dependency.
 
-Normal output contains the frame acquisition time and decoded content:
+Default request: 1920x1080 at 30 fps, preferring advertised MJPEG when suitable.
+Resolution is never silently reduced. A lower advertised frame rate is reported.
+Compare `--fourcc YUYV` if available: MJPEG saves USB bandwidth but costs decoding
+CPU and may damage small modules. Actual frame rate must be measured on the Pi.
 
-```text
-[14:23:05] QR: DRONE-01
-[14:23:08] QR: https://qr-codes.io/zuabFE
-[14:23:08] Link content (https://qr-codes.io/zuabFE): 69
+Profiles are identity-keyed evidence snapshots, not automatically reapplied
+configuration. They record advertised modes/controls, actual dimensions, reported
+format, validated settings and measured frame rate. Each startup negotiates again.
+Provision the WeChat model files before going offline; missing files download on
+first use.
+
+## Camera controls
+
+Default exposure, gain and focus remain under the camera's existing settings.
+Linux disables dynamic exposure frame-rate reduction and resets absolute zoom to
+its advertised minimum where controls exist. Proprietary auto-framing is not
+assumed controllable through standard V4L2.
+
+```bash
+# Starting experiment, not a universal daylight preset:
+python QR_Scanning/scanner.py --exposure-us 1000 --diagnostics
+
+# Opt-in feedback after validating the motion/exposure ceiling:
+python QR_Scanning/scanner.py --adaptive-exposure --max-exposure-us 2000 --diagnostics
 ```
 
-The timestamp is when the camera read completed, before decoding or HTTP lookup.
-Newlines/control characters in payloads are escaped on screen; JSON retains the
-original content. Camera property logs and timings are opt-in with `--diagnostics`.
+Linux uses discovered manual exposure modes and 100-microsecond exposure units,
+with range/step checking and readback. Unsupported controls are reported. Manual
+exposure is not written if the mode change fails. Windows/macOS retain raw
+`--auto-exposure` / `--exposure` options. `--autofocus 0 --focus VALUE` and
+`--gain VALUE` require camera-specific calibration; fixed-focus cameras cannot
+be focused through software.
 
-HTTP(S) payloads are fetched in background workers. HTML main content is extracted
-without scripts, navigation, or footers; plain text and JSON are supported too.
-Your example link was verified to return `69`. Repeated lookups share a bounded
-queue and cache successful content for 60 seconds (errors for five seconds).
-Internet access is required. `--no-resolve-links` disables fetching.
+Adaptive exposure starts at 1000 us unless overridden. It uses recent candidate
+brightness, a deadband, changes of at most 20%, and at least 0.5 seconds between
+changes. It does not automatically increase gain or claim measured sensor
+settling latency. Validate settling using recordings and control-change timestamps.
 
-Lookups use a five-second network timeout, limited redirects, and a 1 MB response
-limit. Private/local destinations and links containing credentials are rejected.
-JavaScript-only pages, login pages, and PDFs/images are not rendered or OCR'd;
-failures are logged as `Link content (...): unavailable - ...`. HTML extraction is
-a best-effort text view, not a general browser. Terminal content is limited to
-500 characters and stored link text to 4000. Unfinished lookups are abandoned on
-exit so they do not hold up camera shutdown.
+## Decoder and output
 
-The JSONL file keeps the original `time`/`data` scan record and appends a separate
-`type: "link_content"` event when lookup completes. That event retains the scan's
-timestamp and QR payload, with `link.url` (final destination), `link.content` or
-`link.error`, and `link.truncated` when applicable. Consumers counting physical
-scans should exclude these link events.
+Tracked regions get the first 75% of the scheduling window. Discovery receives
+25% credit per scan, with debt carried forward after expensive calls. Native
+decoder calls cannot be interrupted: `--budget-ms 150` is a scheduling budget,
+not a hard deadline. Candidates are processed oldest-attempt-first.
 
-Use `--diagnostics` to check the **Actual frames** startup message. Some USB cameras need MJPEG to
-deliver 1080p at a useful rate; try `--fourcc MJPG` if that is a supported mode.
-It is optional because driver support and compression vary. Requesting a higher
-resolution than the camera natively supports does not create detail.
+Recovery tries untouched crops, valid perspective rectification, then at most two
+quality-selected variants: shadow normalization, CLAHE, channel extraction,
+adaptive thresholding or mild sharpening. Windows scale with the configured QR
+module count. A tile-level lighting fallback also helps when localization fails.
 
-macOS uses AVFoundation (allow terminal camera access in System Settings), Windows
-tries MSMF, then DirectShow, then automatic selection; Linux tries V4L2 and
-automatic selection. Use `--backend msmf` or `--backend dshow` to test a specific
-Windows backend without switching. `--diagnostics` reports the opened backend.
-MSMF hardware transforms default to disabled to avoid GPU initialization delays;
-an explicitly set `OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS` environment variable
-overrides this. The index mismatch, rather than a demonstrated privacy restriction,
-was the cause of the latest failed `--camera 1` attempt.
-A DSHOW "can't be used to capture by index" warning means that attempt failed;
-if a preview appears afterward, a fallback succeeded. If nothing opens, check the
-camera index, USB connection, other apps using it, and Windows camera permissions
-including desktop app access. A Pi CSI/libcamera camera may need a separate capture adapter; this script
-uses OpenCV `VideoCapture`.
-
-## Controls
+The recent-frame cache retains at most 0.5 seconds and 64 MiB. Best-history
+selection uses tracked regions when available, followed by re-localization.
+Active frames, worker queues and native libraries use additional memory; this
+is not a total-process memory limit. Separate capture, decode and output workers
+have bounded queues and report dropped results.
 
 | Option | Purpose |
 | --- | --- |
-| `--width 1920 --height 1080 --fps 30` | Default requested camera mode; actual delivery is reported. |
-| `--autofocus 1` | Request autofocus when supported; inspect whether it focuses on the target. |
-| `--autofocus 0 --focus VALUE` | Lock a tested focus position; units depend on the camera. |
-| `--auto-exposure VALUE --exposure VALUE` | Set raw backend-specific mode/exposure values. |
-| `--gain VALUE` | Request camera gain. |
-| `--tiles-per-frame 1` | Less work per scan; slower spatial coverage. Default: 2. |
-| `--tiles-per-frame 4` | Faster spatial coverage, more work per scan. |
-| `--tile-size 640` | Default native tile edge with 25% overlap. |
-| `--interval 0.10` | Minimum interval between scan starts, not a guarantee of 10 scans/s. |
-| `--no-lighting` | Disable tile lighting variants for comparison; candidate recovery still uses CLAHE. |
-| `--no-zxing` | Use OpenCV decoders only. |
-| `--tiles-per-frame 0` | Disable tile/candidate recovery, keeping the full-frame path. |
-| `--no-preview` | Disable the default `cv2.imshow` window. |
-| `--no-resolve-links` | Log QR URLs without fetching linked text. |
-| `--diagnostics` | Show camera configuration, actual resolution, and processing statistics. |
+| `--qr-modules 29` | Actual symbol modules per side, excluding border; default is an estimate. |
+| `--budget-ms 150` | Scheduling budget before native-call overruns. |
+| `--tile-size 640 --tiles-per-frame 2` | Native discovery tiles with 25% overlap; count is an upper bound. |
+| `--tiles-per-frame 0` | Disable tiled discovery, retaining initial full-frame acquisition and tracking. |
+| `--interval 0.10` | Minimum interval between decode batches. |
+| `--no-lighting` / `--no-zxing` | Ablation controls for comparisons. |
+| `--diagnostics` | Timings, observed FPS, queue drops, CPU and Pi temperature/throttling when available. |
+| `--log-observations` | Add structured provisional/confirmed observations to JSONL. |
+| `--save-frames DIRECTORY` | Asynchronously save a native PNG about every two seconds. |
+| `--no-preview` | Disable preview; `--competition` also disables PNG saving. |
+| `--no-resolve-links` | Disable HTTP lookup. |
 
-Exposure/focus/gain stay at existing camera settings unless requested. Diagnostics
-print property acceptance and readback. There is no universal numeric outdoor exposure preset:
-[OpenCV properties depend on hardware and backend](https://docs.opencv.org/4.x/d4/d15/group__videoio__flags__base.html).
-
-The raw image is tried first. Failed tiles receive one retry variant: CLAHE,
-shadow normalization, mild sharpening, adaptive thresholding, or channel contrast.
-The variant changes after each spatial sweep. Independent OpenCV candidates enable
-padded crop/upscale recovery even when WeChat returns no corners.
-
-At 1080p, eight default tiles take four scans per sweep and 20 scans to schedule
-all five variants everywhere when raw decoding fails. Rapid motion can outrun
-this rolling search. More tiles per scan shorten that delay at greater CPU cost.
-
-The capture thread replaces one latest frame continuously. It avoids an application
-backlog, but cannot eliminate buffering inside a camera driver. Diagnostics include
-decode time, age since frame read completed, sweep size, successful methods, and
-nearly black/white pixel fractions. Those fractions cover the whole scene and
-are not standalone exposure scores.
-
-## Field evidence and comparisons
-
-Save untouched native PNG frames about every two seconds while measuring distance:
-
-```powershell
-.\venv\Scripts\python.exe QR_Scanning/scanner.py --diagnostics --save-frames QR_Scanning/captures
-.\venv\Scripts\python.exe QR_Scanning/benchmark.py --input-dir QR_Scanning/captures --expected DRONE-01 --passes 20
+```text
+[14:23:05] QR: https://qr-codes.io/zuabFE
+[14:23:05] Link content (https://qr-codes.io/zuabFE): 69
 ```
 
-Substitute the actual payload for `DRONE-01`, or omit `--expected` for manual
-inspection. All scored input frames should have that same expected content.
-Frames keep accumulating until scanning stops; monitor disk usage. Capture and
-benchmark output directories are ignored by Git.
+Times mean completion of the confirming camera read, not exposure start or HTTP
+completion. Payloads are preserved and terminal control characters escaped.
+Original `time`/`data` JSONL records remain compatible; optional `observation`
+records add geometry, frame/track IDs, methods, quality and confirmation.
+`link_content` events remain separate asynchronous results. Scan counters must
+exclude those additional event types.
 
-Reproduce the synthetic comparison and camera-free regression tests:
+HTTP resolution retains bounded workers, caching, public-URL validation, response
+limits and a five-second network timeout. It handles static HTML/text/JSON, not
+logged-in or JavaScript-rendered pages. Network failure does not invalidate QR
+decoding.
 
-```powershell
-.\venv\Scripts\python.exe QR_Scanning/benchmark.py --save-images
-.\venv\Scripts\python.exe -m unittest discover -s QR_Scanning/tests -v
+`read_and_decompress_ms` combines camera read and decompression: this OpenCV path
+cannot separately time sensor exposure, USB transfer and JPEG decoding. Timestamps
+are read-completion times. The preview's `ppm~` estimate depends on the supplied
+module count and must not be mistaken for a calibrated range guarantee.
+
+Library compatibility: `QRScanner.decode(frame)` returns provisional payload
+strings for still-image callers. `observe(frame, frame_id, timestamp, captured_at)`
+returns structured observations; distinct frame IDs are necessary for confirmation.
+Use `reset()` between independent sessions. Existing `create_detector`,
+`crop_qr_region`, and `fallback_decode` interfaces remain for mission integration.
+`LegacyQRScanner` retains the preceding scanner for comparison.
+
+## Optical qualification
+
+Measure the QR square including its four-module border, actual module count, and
+compressed-axis image width at 10 m:
+
+```bash
+python QR_Scanning/qualification.py optical --modules 29 --qr-width-mm 280 --distance-m 10 --outer-pixels 45
 ```
 
-The benchmark writes `QR_Scanning/benchmark_output/results.json`, including decoded
-strings, methods, and timing. It advances through up to `--passes` rolling scans
-of each still image, stopping when expected content is found. This does not
-simulate independent live frames or prove outdoor range. See
-[OUTDOOR_RESEARCH.md](OUTDOOR_RESEARCH.md) for the validation procedure.
+Alternatively supply measured `--hfov` and `--tilt-deg`. The report estimates
+native pixels/module and the distance for a four-pixel design margin. It is **not**
+a measured decode range. Upscaling cannot recover information lost to insufficient
+sampling, clipping, blur or obstruction.
+
+## Record and replay field sequences
+
+Record lossless FFV1 video plus read-completion timestamps on the Pi:
+
+```bash
+python QR_Scanning/qualification.py record --seconds 10 --output QR_Scanning/captures/sun-01
+```
+
+The output directory must not already exist. Optional `--device`, `--fourcc`,
+`--fps`, `--width`, `--height`, and `--exposure-us` compare supported modes.
+Recording itself can reduce throughput; saved timestamps and camera counts expose
+that gap. FFV1 adds no lossy encoding stage but cannot undo webcam MJPEG artifacts.
+
+Create an independently labelled manifest (paths relative to the manifest).
+Start timing when the **complete target enters the qualified view during stable
+hover**, not when the decoder notices it. Include at least two seconds afterward:
+
+```json
+{
+  "trials": [{
+    "id": "sun-session01-attempt01",
+    "condition": "sun",
+    "video": "sun-01/capture.mkv",
+    "timestamps_file": "sun-01/timestamps.json",
+    "start_s": 1.0,
+    "end_s": 3.5,
+    "expected": ["https://qr-codes.io/zuabFE"],
+    "distance_m": 10,
+    "obliquity_deg": 0,
+    "stable_hover": true,
+    "modules": 29
+  }]
+}
+```
+
+Use `expected: []` for negative trials. Trial independence must be established
+in the field; relabelling adjacent frames does not create independent attempts.
+
+```bash
+python QR_Scanning/qualification.py replay QR_Scanning/captures/trials.json --compare-legacy --output QR_Scanning/benchmark_output/field.json
+python QR_Scanning/benchmark.py --output QR_Scanning/benchmark_output/stills.json
+python -m unittest discover -s QR_Scanning/tests -v
+```
+
+Replay skips frames unavailable under measured decoder compute, and applies
+two-frame confirmation to both implementations. It reports latency, wrong payloads,
+negative controls, coarse failure stage, and exact one-sided binomial bounds.
+It does not model the full asynchronous history scheduler or live USB/output
+latency, and cannot distinguish optics from localization solely from a missed QR.
+
+The replay gate requires at least 300 eligible 10 m trials per daylight category
+(`sun`, `shade`, `overcast`, `backlight`, `transition`), a 95% lower success
+bound of at least 99%, and no wrong confirmed payloads. Zero failures in 300
+independent attempts satisfies that bound. Final field acceptance additionally
+requires live end-to-end latency and sustained Pi thermal/motion testing.
+
+Historical optical research and earlier benchmark results are in
+[OUTDOOR_RESEARCH.md](OUTDOOR_RESEARCH.md).

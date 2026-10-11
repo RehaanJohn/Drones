@@ -107,8 +107,7 @@ def main(argv=None):
         started = time.perf_counter()
         old_payloads, _ = baseline.detectAndDecode(frame)
         old_ms = (time.perf_counter() - started) * 1000
-        improved.cursor = 0
-        improved.shape = None
+        improved.reset()
         payloads = set()
         scan_times = []
         methods = []

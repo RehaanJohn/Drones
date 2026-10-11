@@ -1,9 +1,11 @@
 """QR scanner with a live preview, readable scan logs, and background link lookup."""
 import argparse
 import datetime
+import importlib
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import sys
 import threading
@@ -14,12 +16,26 @@ os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
 
-if __package__:
-    from .link_resolver import LinkResolver, is_web_url
-    from .camera_devices import find_working_camera, list_cameras
-else:
-    from link_resolver import LinkResolver, is_web_url
-    from camera_devices import find_working_camera, list_cameras
+def _component(name):
+    return importlib.import_module('.' + name, __package__) if __package__ else importlib.import_module(name)
+
+
+# Keep the standalone decoder helpers importable by the ROS adapter, which copies only scanner.py.
+# Camera/network dependencies are loaded only when their functionality is used.
+def LinkResolver(*args, **kwargs):
+    return _component('link_resolver').LinkResolver(*args, **kwargs)
+
+
+def is_web_url(value):
+    return _component('link_resolver').is_web_url(value)
+
+
+def find_working_camera(*args, **kwargs):
+    return _component('camera_devices').find_working_camera(*args, **kwargs)
+
+
+def list_cameras(*args, **kwargs):
+    return _component('camera_devices').list_cameras(*args, **kwargs)
 
 try:
     import zxingcpp
@@ -178,7 +194,7 @@ def tile_regions(shape, tile_size=640, overlap=0.25):
             for y in starts(height) for x in starts(width)]
 
 
-class QRScanner:
+class LegacyQRScanner:
     """Native-resolution decoding plus a rolling search of overlapping tiles.
 
     Work is bounded by tile count, not a fictitious hard time limit: a native
@@ -283,6 +299,31 @@ class QRScanner:
             "methods": methods,
         }
         return decoded
+
+
+class QRScanner(LegacyQRScanner):
+    """Compatibility payload API plus structured, two-frame-confirmed observations."""
+    def __init__(self, detector=None, tile_size=640, tiles_per_frame=2,
+                 use_zxing=True, lighting=True, budget_ms=150, modules=29):
+        super().__init__(detector, tile_size, tiles_per_frame, use_zxing, lighting)
+        if __package__:
+            from .tracking import TrackingDecoder
+        else:
+            from tracking import TrackingDecoder
+        self.tracker = TrackingDecoder(self, zxingcpp, crop_qr_region, tile_regions, budget_ms, modules)
+
+    def decode(self, frame):
+        # Still-image callers retain provisional payloads; live runtime uses observe().
+        return self.tracker.decode(frame)
+
+    def observe(self, frame, frame_id=None, timestamp=None, captured_at=None):
+        self.tracker.decode(frame, frame_id, timestamp, captured_at)
+        return self.tracker.observations
+
+    def reset(self):
+        self.tracker.reset()
+        self.cursor = 0
+        self.shape = None
 
 
 class ScanWriter:
@@ -526,6 +567,16 @@ def make_parser():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--camera", type=int, help="Explicit camera index; default discovers a working RGB camera on Windows")
     source.add_argument("--camera-name", help="Select a Windows camera by name, e.g. 'Lenovo Performance RGB Camera'")
+    source.add_argument("--device", help="Linux webcam path, preferably /dev/v4l/by-id/...")
+    parser.add_argument("--inspect-camera", action="store_true", help="Print Linux modes and controls without opening capture")
+    parser.add_argument("--profile-dir", type=Path, help="Save validated Linux camera profiles here")
+    parser.add_argument("--competition", action="store_true", help="Headless Pi profile; disables preview and frame saving")
+    parser.add_argument("--exposure-us", type=int, help="Linux manual exposure in microseconds, e.g. 1000; uses discovered controls")
+    parser.add_argument("--adaptive-exposure", action="store_true", help="Opt in to bounded candidate-metered Linux exposure control")
+    parser.add_argument("--max-exposure-us", type=int, default=2000, help="Motion-calibrated exposure ceiling for adaptive control")
+    parser.add_argument("--budget-ms", type=float, default=150, help="Decoder scheduling budget; native calls may overrun")
+    parser.add_argument("--qr-modules", type=int, default=29, help="Actual QR symbol modules per side (without quiet zone); default estimate 29")
+    parser.add_argument("--log-observations", action="store_true", help="Include provisional geometry/quality records in JSONL")
     parser.add_argument("--list-cameras", action="store_true", help="List current Windows camera names, indices, and backends")
     parser.add_argument("--backend", choices=("auto", "msmf", "dshow", "avfoundation", "v4l2", "any"),
                         default="auto", help="Capture backend; auto tries MSMF first on Windows")
@@ -552,89 +603,125 @@ def make_parser():
 
 
 def main(argv=None):
+    if __package__:
+        from .pipeline import (ProcessCapture, FrameHistory, DecoderWorker, OutputWorker, overlay, system_metrics)
+        from . import linux_camera
+    else:
+        from pipeline import (ProcessCapture, FrameHistory, DecoderWorker, OutputWorker, overlay, system_metrics)
+        import linux_camera
     parser = make_parser()
     args = parser.parse_args(argv)
     if (args.width <= 0 or args.height <= 0 or not math.isfinite(args.fps) or args.fps <= 0
-            or not math.isfinite(args.interval) or args.interval < 0
-            or args.tile_size < 128 or args.tiles_per_frame < 0):
-        parser.error("Positive width/height/fps, tile-size >=128, and nonnegative interval/tiles required")
+            or not math.isfinite(args.interval) or args.interval < 0 or args.tile_size < 128
+            or args.tiles_per_frame < 0 or not math.isfinite(args.budget_ms) or args.budget_ms <= 0
+            or args.qr_modules < 21 or args.qr_modules > 177 or (args.qr_modules - 21) % 4):
+        parser.error('Invalid dimensions, frame rate, scan budget, interval, tiles, or QR module count')
     if args.fourcc and len(args.fourcc) != 4:
-        parser.error("--fourcc must be exactly four characters")
-    for name in ("auto_exposure", "exposure", "focus", "gain"):
+        parser.error('--fourcc must be exactly four characters')
+    if args.max_exposure_us <= 0 or (args.exposure_us is not None and args.exposure_us <= 0):
+        parser.error('--exposure-us must be positive')
+    if args.adaptive_exposure and (args.exposure_us or 1000) > args.max_exposure_us:
+        parser.error('Initial exposure must not exceed --max-exposure-us when adaptive control is enabled')
+    for name in ('auto_exposure', 'exposure', 'focus', 'gain'):
         value = getattr(args, name)
         if value is not None and not math.isfinite(value):
-            parser.error(f"--{name.replace('_', '-')} must be finite")
-    cap = None
-    preview = Preview() if not args.no_preview else None
-    resolver = None
+            parser.error(f'--{name} must be finite')
+    linux = sys.platform.startswith('linux')
+    if not linux and (args.device or args.inspect_camera or args.exposure_us or args.profile_dir or args.adaptive_exposure):
+        parser.error('--device, --inspect-camera, --exposure-us and --profile-dir require Linux V4L2')
+    if linux and (args.exposure is not None or args.auto_exposure is not None):
+        parser.error('Use --exposure-us on Linux; raw backend exposure values are not portable')
+    if linux and (args.camera_name or args.backend not in ('auto', 'v4l2')):
+        parser.error('Linux capture uses --device or --camera and --backend v4l2/auto')
+    if args.competition:
+        args.no_preview, args.save_frames = True, None
+    cap = resolver = preview = None
     try:
-        if args.list_cameras:
-            if sys.platform != 'win32':
-                raise RuntimeError('--list-cameras is currently supported on Windows')
-            devices = list_cameras(args.backend)
-            for device in devices:
-                print(f'{device.name} | --camera {device.index} --backend '
-                      f'{cv2.videoio_registry.getBackendName(device.backend).lower()}', flush=True)
-            if not devices:
-                print('No video cameras are currently exposed by Windows.', flush=True)
+        if args.list_cameras or args.inspect_camera:
+            if linux:
+                selected = args.device or (f'/dev/video{args.camera}' if args.camera is not None else None)
+                entries = [linux_camera.inspect(selected)] if selected else linux_camera.list_devices()
+                print(json.dumps(entries, indent=2))
+            else:
+                for device in list_cameras(args.backend):
+                    print(f'{device.name} | --camera {device.index} --backend '
+                          f'{cv2.videoio_registry.getBackendName(device.backend).lower()}')
             return 0
         args.output.parent.mkdir(parents=True, exist_ok=True)
         if args.save_frames:
             args.save_frames.mkdir(parents=True, exist_ok=True)
-        with args.output.open("a", encoding="utf-8") as stream:
-            detector = QRScanner(tile_size=args.tile_size, tiles_per_frame=args.tiles_per_frame,
-                                 use_zxing=not args.no_zxing, lighting=not args.no_lighting)
-            if args.diagnostics and not args.no_zxing and zxingcpp is None:
-                print("ZXing unavailable; using OpenCV only. Install QR_Scanning/requirements.txt.",
-                      file=sys.stderr, flush=True)
+        detector = QRScanner(tile_size=args.tile_size, tiles_per_frame=args.tiles_per_frame,
+                             use_zxing=not args.no_zxing, lighting=not args.no_lighting,
+                             budget_ms=args.budget_ms, modules=args.qr_modules)
+        if linux:
+            source = ProcessCapture(vars(args))
+        else:
             cap = open_camera(args.camera, args.backend, args.diagnostics, args.camera_name)
             configure_camera(cap, args)
-            resolver = LinkResolver() if not args.no_resolve_links else None
+            source = LatestFrameCapture(cap)
+            cap = None
+        preview = None if args.no_preview else Preview()
+        resolver = None if args.no_resolve_links else LinkResolver()
+        with args.output.open('a', encoding='utf-8') as stream:
             writer = ScanWriter(stream, resolver=resolver)
-            if args.diagnostics:
-                print(f"Scanning camera {args.camera}. Results: {args.output.resolve()}", file=sys.stderr, flush=True)
-            next_scan = 0.0
-            next_report = 0.0
-            reported_shape = None
-            with LatestFrameCapture(cap) as capture:
-                cap = None  # Capture thread now owns release, including on errors.
+            with source as capture, OutputWorker(writer, args.save_frames, args.log_observations) as output, DecoderWorker(detector, args.interval) as decoder:
+                history = FrameHistory()
+                next_report, count, started, cpu_started = 0, 0, time.monotonic(), time.process_time()
+                profile_saved = False
                 while True:
-                    delay = next_scan - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)
-                    frame, age_ms, captured_at = capture.read()
-                    writer.poll_links()
-                    if preview is not None and not preview.show(frame):
+                    frame, age_ms, captured = capture.read()
+                    if preview is not None and not preview.show(overlay(frame, decoder.observations)):
                         return 0
+                    height, width = frame.shape[:2]
+                    if (width, height) != (args.width, args.height):
+                        raise RuntimeError(f'Camera delivered {width}x{height}, requested {args.width}x{args.height}. '
+                                           'Select a supported resolution explicitly.')
                     now = time.monotonic()
-                    next_scan = now + args.interval
-                    if frame.shape[:2] != reported_shape:
-                        reported_shape = frame.shape[:2]
-                        height, width = reported_shape
-                        if args.diagnostics:
-                            print(f"Actual frames: {width}x{height}; ZXing={detector.use_zxing}",
-                                  file=sys.stderr, flush=True)
-                            if (width, height) != (args.width, args.height):
-                                print("Camera did not deliver the requested resolution. Check its supported modes/format.",
-                                      file=sys.stderr, flush=True)
-                    scan_frame(detector, frame, writer, captured_at)
+                    stamp = capture.captured_monotonic if linux else now - age_ms / 1000
+                    history.add(frame, captured, stamp)
+                    count += 1
+                    decoder.submit(history.snapshot())
+                    if decoder.error:
+                        raise RuntimeError(f'Decoder failed: {decoder.error}') from decoder.error
+                    if output.error:
+                        raise RuntimeError(f'Output failed: {output.error}') from output.error
+                    while True:
+                        try:
+                            observations, stats = decoder.results.get_nowait()
+                        except queue.Empty:
+                            break
+                        output.submit(observations)
+                        if linux and args.adaptive_exposure:
+                            candidates = [o for o in observations if o['corners'] is not None]
+                            if candidates:
+                                capture.meter(max(candidates, key=lambda o: o['quality']['score']))
                     if now >= next_report:
                         next_report = now + 2
+                        elapsed = max(.001, now - started)
+                        stats = dict(decoder.stats, delivered_fps=round(count / elapsed, 2),
+                                     history_mb=round(history.bytes / 1024**2, 2),
+                                     cpu_percent=round(100 * (time.process_time() - cpu_started) / elapsed, 1),
+                                     output_drops=output.dropped, result_drops=decoder.dropped_results,
+                                     **(system_metrics() if args.diagnostics else {}))
+                        if linux and capture.profile:
+                            stats['camera'] = capture.profile
+                            if args.profile_dir and not profile_saved and elapsed >= 2:
+                                linux_camera.save_profile(args.profile_dir, capture.profile)
+                                profile_saved = True
+                            if count == 1:
+                                for name, result in capture.profile['applied_controls'].items():
+                                    if not result.get('validated'):
+                                        print(f'Camera control {name} was not applied: {result}', file=sys.stderr)
+                                if abs(capture.profile['selected_mode']['fps'] - args.fps) > .1:
+                                    print(f'Camera advertised FPS differs from request: {capture.profile["selected_mode"]}', file=sys.stderr)
                         if args.diagnostics:
-                            gray = grayscale(frame)
-                            stats = dict(detector.last_stats, frame_age_ms=round(age_ms, 1),
-                                         dark_pct=round(float(np.mean(gray <= 5)) * 100, 1),
-                                         bright_pct=round(float(np.mean(gray >= 250)) * 100, 1))
-                            print("Diagnostics " + json.dumps(stats), file=sys.stderr, flush=True)
+                            print('Diagnostics ' + json.dumps(stats), file=sys.stderr, flush=True)
                         if args.save_frames:
-                            name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f.png")
-                            path = args.save_frames / name
-                            if not cv2.imwrite(str(path), frame):
-                                raise OSError(f"Could not save frame: {path}")
+                            output.submit([], (captured, frame))
     except KeyboardInterrupt:
         return 0
-    except (OSError, RuntimeError, cv2.error) as exc:
-        print(f"Scanner error: {exc}", file=sys.stderr, flush=True)
+    except (OSError, RuntimeError, ValueError, cv2.error) as exc:
+        print(f'Scanner error: {exc}', file=sys.stderr, flush=True)
         return 1
     finally:
         if cap is not None:
@@ -645,5 +732,5 @@ def main(argv=None):
             resolver.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

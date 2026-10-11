@@ -5,3 +5,5 @@ venv/
 wechat_models/
 qr_scans.jsonl
 wechat_models/*.part
+captures/
+benchmark_output/

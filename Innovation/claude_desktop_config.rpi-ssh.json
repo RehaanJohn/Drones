@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "pixhawk": {
-      "command": "/usr/bin/ssh",
+      "command": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
       "args": [
         "-T",
         "-o",

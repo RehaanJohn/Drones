@@ -1,4 +1,4 @@
-"""Discover Windows cameras and check frame delivery with a bounded probe."""
+"""Discover Windows/macOS cameras and check delivery with a bounded probe."""
 import os
 from pathlib import Path
 import subprocess
@@ -10,12 +10,20 @@ import cv2
 
 
 def list_cameras(backend='auto'):
-    from cv2_enumerate_cameras import enumerate_cameras
-    choices = {'auto': (cv2.CAP_MSMF, cv2.CAP_DSHOW),
-               'any': (cv2.CAP_MSMF, cv2.CAP_DSHOW),
-               'msmf': (cv2.CAP_MSMF,), 'dshow': (cv2.CAP_DSHOW,)}
+    if sys.platform == 'darwin':
+        choices = {'auto': (cv2.CAP_AVFOUNDATION,), 'any': (cv2.CAP_AVFOUNDATION,),
+                   'avfoundation': (cv2.CAP_AVFOUNDATION,)}
+    else:
+        choices = {'auto': (cv2.CAP_MSMF, cv2.CAP_DSHOW),
+                   'any': (cv2.CAP_MSMF, cv2.CAP_DSHOW),
+                   'msmf': (cv2.CAP_MSMF,), 'dshow': (cv2.CAP_DSHOW,)}
     if backend not in choices:
-        raise RuntimeError('Windows camera discovery supports auto, any, msmf, or dshow')
+        raise RuntimeError('Camera discovery supports ' + ', '.join(choices) + ' on this platform')
+    try:
+        from cv2_enumerate_cameras import enumerate_cameras
+    except ImportError as exc:
+        raise RuntimeError('Camera discovery needs cv2-enumerate-cameras. '
+                           'Run python3 -m pip install -r requirements.txt from QR_Scanning.') from exc
     return [camera for api in choices[backend] for camera in enumerate_cameras(api)]
 
 
@@ -41,6 +49,10 @@ def find_working_camera(backend='auto', name=None, diagnostics=False):
         cameras = [c for c in cameras if 'ir' not in c.name.lower().split()
                    and 'infrared' not in c.name.casefold()]
         cameras.sort(key=lambda c: 'rgb' not in c.name.casefold())
+        if sys.platform == 'darwin':
+            # Continuity Camera may sort before the built-in webcam in OpenCV.
+            cameras.sort(key=lambda c: not any(label in c.name.casefold()
+                                               for label in ('macbook', 'facetime', 'built-in')))
     for camera in cameras:
         if diagnostics:
             print(f'Testing {camera.name}: index {camera.index}, {cv2.videoio_registry.getBackendName(camera.backend)}',

@@ -390,7 +390,7 @@ def scan_frame(detector, frame, writer, captured_at=None):
 
 
 def open_camera(index=None, backend="auto", diagnostics=False, camera_name=None):
-    if sys.platform == 'win32' and (index is None or camera_name):
+    if sys.platform in ('win32', 'darwin') and (index is None or camera_name):
         device = find_working_camera(backend, camera_name, diagnostics)
         cap = cv2.VideoCapture(device.index, device.backend)
         if cap.isOpened():
@@ -402,7 +402,7 @@ def open_camera(index=None, backend="auto", diagnostics=False, camera_name=None)
         raise RuntimeError(f'{device.name} delivered a test frame but could not be reopened. '
                            'The device may have disconnected; run --list-cameras.')
     if camera_name:
-        raise RuntimeError('--camera-name is currently supported on Windows; use --camera on this platform')
+        raise RuntimeError('--camera-name is supported on Windows/macOS; use --camera on this platform')
     index = 0 if index is None else index
     backends = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW,
                 "avfoundation": cv2.CAP_AVFOUNDATION, "v4l2": cv2.CAP_V4L2,
@@ -455,6 +455,64 @@ def configure_camera(cap, args):
             print(f"Camera {name}: requested={value}, reported={actual}, accepted={accepted}",
                   file=sys.stderr, flush=True)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Best effort; many backends ignore this.
+
+
+class MainThreadCapture:
+    """Read macOS cameras on the same thread that opened them and pumps HighGUI."""
+
+    def __init__(self, cap):
+        self.cap = cap
+
+    def __enter__(self):
+        return self
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if not ok or frame is None or not frame.size:
+            raise RuntimeError('Camera returned no image.')
+        return frame, 0.0, datetime.datetime.now().astimezone()
+
+    def __exit__(self, *exc):
+        self.cap.release()
+
+
+def frame_metrics(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return {'image_mean': round(float(gray.mean()), 2),
+            'image_min': int(gray.min()), 'image_max': int(gray.max()),
+            'image_std': round(float(gray.std()), 2)}
+
+
+def camera_test(args):
+    """Show and optionally save raw frames without running any decoder workers."""
+    cap = open_camera(args.camera, args.backend, True, args.camera_name)
+    preview = Preview()
+    try:
+        configure_camera(cap, args)
+        started = time.monotonic()
+        next_report = 0
+        saved = False
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None or not frame.size:
+                raise RuntimeError('Camera returned no image.')
+            now = time.monotonic()
+            if now >= next_report:
+                next_report = now + 2
+                print('Raw camera ' + json.dumps(dict(width=frame.shape[1], height=frame.shape[0],
+                                                       **frame_metrics(frame))), flush=True)
+            if args.save_frames and not saved and now - started >= 2:
+                args.save_frames.mkdir(parents=True, exist_ok=True)
+                path = args.save_frames / 'raw_camera.png'
+                if not cv2.imwrite(str(path), frame):
+                    raise RuntimeError(f'Could not save {path}')
+                print(f'Raw camera image saved to {path.resolve()}', flush=True)
+                saved = True
+            if not preview.show(frame):
+                return 0
+    finally:
+        cap.release()
+        preview.close()
 
 
 class LatestFrameCapture:
@@ -533,6 +591,17 @@ class Preview:
 
     def __init__(self):
         self.opened = False
+        self.last_key = -1
+        self.diagnostics = False
+
+    def enable_diagnostics(self):
+        self.diagnostics = True
+
+    def controls(self):
+        if not self.opened or not self.diagnostics:
+            return dict(brightness=100, blur=0, shadow=0, glare=0)
+        return {name: cv2.getTrackbarPos(name, self.NAME)
+                for name in ('brightness', 'blur', 'shadow', 'glare')}
 
     def show(self, frame):
         if not self.opened:
@@ -544,8 +613,13 @@ class Preview:
             self.opened = True
             height, width = frame.shape[:2]
             cv2.resizeWindow(self.NAME, min(width, 1280), round(height * min(1, 1280 / width)))
+            if self.diagnostics:
+                for name, value, maximum in [('brightness', 100, 200), ('blur', 0, 10),
+                                              ('shadow', 0, 100), ('glare', 0, 100)]:
+                    cv2.createTrackbar(name, self.NAME, value, maximum, lambda value: None)
         cv2.imshow(self.NAME, frame)
         key = cv2.waitKey(1) & 0xFF
+        self.last_key = key
         if key in (ord('q'), ord('Q'), 27):
             return False
         try:
@@ -565,19 +639,20 @@ class Preview:
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--camera", type=int, help="Explicit camera index; default discovers a working RGB camera on Windows")
-    source.add_argument("--camera-name", help="Select a Windows camera by name, e.g. 'Lenovo Performance RGB Camera'")
+    source.add_argument("--camera", type=int, help="Explicit camera index; Windows/macOS default discovers a camera, preferring RGB/built-in devices")
+    source.add_argument("--camera-name", help="Select a Windows/macOS camera by name, e.g. 'MacBook Air Camera'")
     source.add_argument("--device", help="Linux webcam path, preferably /dev/v4l/by-id/...")
     parser.add_argument("--inspect-camera", action="store_true", help="Print Linux modes and controls without opening capture")
     parser.add_argument("--profile-dir", type=Path, help="Save validated Linux camera profiles here")
     parser.add_argument("--competition", action="store_true", help="Headless Pi profile; disables preview and frame saving")
+    parser.add_argument('--camera-test', action='store_true', help='Preview raw camera frames without QR processing; optionally save with --save-frames')
     parser.add_argument("--exposure-us", type=int, help="Linux manual exposure in microseconds, e.g. 1000; uses discovered controls")
     parser.add_argument("--adaptive-exposure", action="store_true", help="Opt in to bounded candidate-metered Linux exposure control")
     parser.add_argument("--max-exposure-us", type=int, default=2000, help="Motion-calibrated exposure ceiling for adaptive control")
     parser.add_argument("--budget-ms", type=float, default=150, help="Decoder scheduling budget; native calls may overrun")
     parser.add_argument("--qr-modules", type=int, default=29, help="Actual QR symbol modules per side (without quiet zone); default estimate 29")
     parser.add_argument("--log-observations", action="store_true", help="Include provisional geometry/quality records in JSONL")
-    parser.add_argument("--list-cameras", action="store_true", help="List current Windows camera names, indices, and backends")
+    parser.add_argument("--list-cameras", action="store_true", help="List current camera names, indices/devices, and backends")
     parser.add_argument("--backend", choices=("auto", "msmf", "dshow", "avfoundation", "v4l2", "any"),
                         default="auto", help="Capture backend; auto tries MSMF first on Windows")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Append-only JSON Lines scan file")
@@ -597,7 +672,12 @@ def make_parser():
     parser.add_argument("--no-lighting", action="store_true", help="Disable lighting variants for comparisons")
     parser.add_argument("--no-preview", action="store_true", help="Disable the default OpenCV camera window")
     parser.add_argument("--no-resolve-links", action="store_true", help="Log QR URLs without fetching their text")
-    parser.add_argument("--diagnostics", action="store_true", help="Print timing and image statistics every 2 seconds")
+    parser.add_argument("--diagnostics", action="store_true", help="Show diagnostic test controls and quality metrics; competition prints statistics only")
+    parser.add_argument('--diagnostics-dir', type=Path, help='Parent directory for timestamped diagnostic runs, trials and snapshots')
+    parser.add_argument('--expected-payload', help='Ground truth for diagnostic evaluation only; never sent to decoder')
+    parser.add_argument('--condition', default='baseline', help='Diagnostic condition label, e.g. sunlight/shadow/motion')
+    parser.add_argument('--distance-m', type=float, help='Operator-measured QR distance for diagnostic trials')
+    parser.add_argument('--trial-seconds', type=float, default=10, help='Duration of each diagnostic trial; T restarts')
     parser.add_argument("--save-frames", type=Path, help="Save raw PNGs here every 2 seconds for offline evaluation")
     return parser
 
@@ -618,6 +698,9 @@ def main(argv=None):
         parser.error('Invalid dimensions, frame rate, scan budget, interval, tiles, or QR module count')
     if args.fourcc and len(args.fourcc) != 4:
         parser.error('--fourcc must be exactly four characters')
+    if not math.isfinite(args.trial_seconds) or args.trial_seconds <= 0 or (args.distance_m is not None and
+            (not math.isfinite(args.distance_m) or args.distance_m <= 0)):
+        parser.error('Trial duration and measured distance must be positive and finite')
     if args.max_exposure_us <= 0 or (args.exposure_us is not None and args.exposure_us <= 0):
         parser.error('--exposure-us must be positive')
     if args.adaptive_exposure and (args.exposure_us or 1000) > args.max_exposure_us:
@@ -627,6 +710,8 @@ def main(argv=None):
         if value is not None and not math.isfinite(value):
             parser.error(f'--{name} must be finite')
     linux = sys.platform.startswith('linux')
+    if args.camera_test and (linux or args.competition or args.no_preview):
+        parser.error('--camera-test requires a desktop camera with preview enabled')
     if not linux and (args.device or args.inspect_camera or args.exposure_us or args.profile_dir or args.adaptive_exposure):
         parser.error('--device, --inspect-camera, --exposure-us and --profile-dir require Linux V4L2')
     if linux and (args.exposure is not None or args.auto_exposure is not None):
@@ -635,8 +720,10 @@ def main(argv=None):
         parser.error('Linux capture uses --device or --camera and --backend v4l2/auto')
     if args.competition:
         args.no_preview, args.save_frames = True, None
-    cap = resolver = preview = None
+    cap = resolver = preview = diagnostic = None
     try:
+        if args.camera_test:
+            return camera_test(args)
         if args.list_cameras or args.inspect_camera:
             if linux:
                 selected = args.device or (f'/dev/video{args.camera}' if args.camera is not None else None)
@@ -658,26 +745,47 @@ def main(argv=None):
         else:
             cap = open_camera(args.camera, args.backend, args.diagnostics, args.camera_name)
             configure_camera(cap, args)
-            source = LatestFrameCapture(cap)
+            source = MainThreadCapture(cap) if sys.platform == 'darwin' else LatestFrameCapture(cap)
             cap = None
         preview = None if args.no_preview else Preview()
+        if args.diagnostics and not args.competition:
+            DiagnosticSession = _component('diagnostics').DiagnosticSession
+            directory = (args.diagnostics_dir or (Path(__file__).resolve().parent / 'diagnostic_runs')) / datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            options = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+            diagnostic = DiagnosticSession(directory, args.expected_payload, args.condition,
+                                           args.distance_m, args.trial_seconds, args.qr_modules,
+                                           not args.no_lighting, options)
+            if preview is not None:
+                preview.enable_diagnostics()
+            print(f'Diagnostic results: {directory.resolve()}', flush=True)
         resolver = None if args.no_resolve_links else LinkResolver()
         with args.output.open('a', encoding='utf-8') as stream:
             writer = ScanWriter(stream, resolver=resolver)
-            with source as capture, OutputWorker(writer, args.save_frames, args.log_observations) as output, DecoderWorker(detector, args.interval) as decoder:
+            with source as capture, OutputWorker(writer, args.save_frames, args.log_observations) as output, DecoderWorker(detector, args.interval, diagnostics=diagnostic is not None) as decoder:
                 history = FrameHistory()
                 next_report, count, started, cpu_started = 0, 0, time.monotonic(), time.process_time()
                 profile_saved = False
+                reported_mode = None
                 while True:
                     frame, age_ms, captured = capture.read()
-                    if preview is not None and not preview.show(overlay(frame, decoder.observations)):
+                    frame_stamp = capture.captured_monotonic if linux else time.monotonic() - age_ms / 1000
+                    if diagnostic is not None:
+                        controls = preview.controls() if preview is not None else diagnostic.controls
+                        frame = diagnostic.prepare(frame, time.monotonic(), controls)
+                    # Show diagnostics after consuming completed observations below.
+                    if diagnostic is None and preview is not None and not preview.show(overlay(frame, decoder.observations)):
                         return 0
                     height, width = frame.shape[:2]
                     if (width, height) != (args.width, args.height):
-                        raise RuntimeError(f'Camera delivered {width}x{height}, requested {args.width}x{args.height}. '
-                                           'Select a supported resolution explicitly.')
+                        if sys.platform != 'darwin':
+                            raise RuntimeError(f'Camera delivered {width}x{height}, requested {args.width}x{args.height}. '
+                                               'Select a supported resolution explicitly.')
+                        if reported_mode != (width, height):
+                            print(f'Camera selected {width}x{height}; continuing at its actual resolution '
+                                  f'(requested {args.width}x{args.height}).', file=sys.stderr, flush=True)
+                            reported_mode = (width, height)
                     now = time.monotonic()
-                    stamp = capture.captured_monotonic if linux else now - age_ms / 1000
+                    stamp = frame_stamp
                     history.add(frame, captured, stamp)
                     count += 1
                     decoder.submit(history.snapshot())
@@ -691,6 +799,8 @@ def main(argv=None):
                         except queue.Empty:
                             break
                         output.submit(observations)
+                        if diagnostic is not None:
+                            diagnostic.consume(observations, stats)
                         if linux and args.adaptive_exposure:
                             candidates = [o for o in observations if o['corners'] is not None]
                             if candidates:
@@ -715,15 +825,23 @@ def main(argv=None):
                                 if abs(capture.profile['selected_mode']['fps'] - args.fps) > .1:
                                     print(f'Camera advertised FPS differs from request: {capture.profile["selected_mode"]}', file=sys.stderr)
                         if args.diagnostics:
+                            stats.update(frame_metrics(frame))
                             print('Diagnostics ' + json.dumps(stats), file=sys.stderr, flush=True)
                         if args.save_frames:
                             output.submit([], (captured, frame))
+                    if diagnostic is not None and preview is not None:
+                        display_stats = dict(decoder.stats, delivered_fps=count / max(.001, now - started))
+                        if not preview.show(diagnostic.render(frame, display_stats, time.monotonic())):
+                            return 0
+                        diagnostic.key(preview.last_key, decoder, time.monotonic())
     except KeyboardInterrupt:
         return 0
     except (OSError, RuntimeError, ValueError, cv2.error) as exc:
         print(f'Scanner error: {exc}', file=sys.stderr, flush=True)
         return 1
     finally:
+        if diagnostic is not None:
+            diagnostic.close()
         if cap is not None:
             cap.release()
         if preview is not None:

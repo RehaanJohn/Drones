@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -97,6 +98,28 @@ class LinuxCameraTests(unittest.TestCase):
 
 
 class TrackingTests(unittest.TestCase):
+    def test_overrunning_full_scan_does_not_starve_native_tiles(self):
+        detector = Mock()
+        def slow_decode(image):
+            time.sleep(.015)
+            return ([], [])
+        detector.detectAndDecode.side_effect = slow_decode
+        engine = scanner.QRScanner(detector, use_zxing=False, lighting=False,
+                                   tiles_per_frame=1, budget_ms=1)
+        frame = np.zeros((200, 400, 3), np.uint8)
+        engine.observe(frame, 1, 10)
+        self.assertEqual(engine.cursor, 0)
+        self.assertGreater(engine.last_stats['budget_overrun_ms'], 0)
+        engine.observe(frame, 2, 10.1)
+        self.assertEqual(engine.cursor, 1)
+
+    def test_successful_crop_does_not_build_unused_recovery_variants(self):
+        engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)
+        engine.observe(qr_frame(), 1, 10)
+        with patch.object(tracking, 'variants', side_effect=AssertionError('Unnecessary correction')):
+            result = engine.observe(qr_frame(), 2, 10.1)
+        self.assertTrue(any(o['confirmed'] for o in result))
+
     def test_duplicate_frame_cannot_confirm_but_second_capture_does(self):
         engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)
         frame = qr_frame()
@@ -151,6 +174,40 @@ class TrackingTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_new_trial_excludes_pretrial_history(self):
+        detector = Mock()
+        detector.tracker = SimpleNamespace(budget=.1, tracks=[])
+        detector.last_stats = {'decode_ms':0}
+        detector.observe.return_value = []
+        frame = np.zeros((100,100,3),np.uint8)
+        now = time.monotonic()
+        history = ((1,now-.1,None,frame), (2,now+.01,None,frame))
+        with pipeline.DecoderWorker(detector,interval=0) as worker:
+            worker.set_lighting(True,since=now)
+            worker.submit(history)
+            _, stats = worker.results.get(timeout=1)
+        self.assertEqual([row['frame_id'] for row in stats['processed_frames']],[2])
+        detector.reset.assert_called_once()
+
+    def test_empty_overbudget_decode_does_not_retry_or_score_history(self):
+        detector = Mock()
+        detector.tracker = SimpleNamespace(budget=.01, tracks=[])
+        detector.last_stats = {'decode_ms':30}
+        def decode(*args):
+            time.sleep(.03)
+            return []
+        detector.observe.side_effect = decode
+        frame = np.zeros((100,100,3), np.uint8)
+        history = ((1,time.monotonic()-.1,None,frame), (2,time.monotonic(),None,frame))
+        with patch.object(pipeline.np, 'percentile', side_effect=AssertionError('Scored old frame outside budget')):
+            with pipeline.DecoderWorker(detector, interval=0) as worker:
+                worker.submit(history)
+                observations, stats = worker.results.get(timeout=1)
+        self.assertEqual(observations, [])
+        detector.observe.assert_called_once()
+        self.assertEqual(detector.observe.call_args.args[1], 2)
+        self.assertEqual(len(stats['processed_frames']), 1)
+
     def test_decoder_worker_confirms_distinct_frames_and_stops(self):
         history = pipeline.FrameHistory()
         detector = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)

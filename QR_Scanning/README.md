@@ -1,6 +1,6 @@
 # Outdoor USB webcam QR scanner
 
-Targets a 1080p USB webcam on Raspberry Pi 4, with Windows preview support.
+Targets a 1080p USB webcam on Raspberry Pi 4, with Windows and macOS preview support.
 Uses native-resolution decoding, candidate tracking, quality-directed recovery
 and two-frame confirmation. **10 m / 99% within two seconds remains a field
 qualification target, not a measured capability.**
@@ -18,6 +18,135 @@ green means the payload matches in two distinct captured frames. Preview is
 independent of decoding. Input frames retain native resolution. Windows camera
 discovery remains available through `--list-cameras`; indices can change after
 USB reconnection.
+
+macOS development (from inside `QR_Scanning`):
+
+```bash
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --diagnostics
+```
+
+macOS reads the camera on the main thread and uses the actual delivered resolution
+when AVFoundation chooses a different mode. Diagnostics include image brightness
+and pixel range; receiving frames alone does not establish a usable camera image.
+For a black preview, isolate capture from all QR processing:
+
+```bash
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --camera-test --save-frames camera_debug
+```
+
+This displays raw frames, prints brightness statistics, and saves
+`camera_debug/raw_camera.png` after two seconds. A normal saved image with a black
+window points to preview rendering; a black saved image means the captured pixels
+are black too. Q or Esc exits the test.
+
+Install the updated requirements to enable macOS camera listing and name selection:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 scanner.py --list-cameras --backend avfoundation
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --diagnostics
+```
+
+Without an explicit camera, macOS discovery prefers a built-in MacBook/FaceTime
+camera. Index 0 can be an iPhone Continuity Camera, and indices may change when
+devices connect or disconnect; use the listed name for stable selection.
+
+## Diagnostic field testing
+
+Run these commands **from inside `QR_Scanning`** with the virtual environment active.
+On the Mac used during development, camera 0 was the iPhone Continuity Camera and
+camera 1 was the MacBook Air camera. Name selection avoids relying on that ordering.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --diagnostics
+```
+
+The display draws yellow outlines around localized QR candidates, cyan around
+decoded payloads awaiting confirmation, and green around payloads confirmed in
+two distinct frames. Localization can continue beyond the distance at which a
+payload is readable, but arbitrary distant pixels cannot reliably be identified
+as a QR. Boxes expire after 0.75 seconds and carry an estimated native pixels/module
+reading based on `--qr-modules`. The panel shows brightness, contrast, sampled
+sharpness, clipping, uneven illumination, decoding time and result age. QR black
+and white areas naturally clip; clipping percentages alone do not prove glare.
+
+For repeatable tests, display or print [diagnostic_target.png](diagnostic_target.png).
+It encodes `diagnostic-test-123` and has 29 modules per side, excluding its quiet
+zone. Place it at a **measured** distance and start a labelled session:
+
+```bash
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation \
+  --diagnostics --expected-payload diagnostic-test-123 --qr-modules 29 \
+  --condition indoor-baseline --distance-m 1 --trial-seconds 10 \
+  --diagnostics-dir diagnostic_runs --no-resolve-links
+```
+
+Use the actual payload/module count when testing your own QR. Expected text is
+used only by the evaluator, never to help the decoder recognize a target. Without
+expected text, the panel reports decode presence rather than correctness.
+
+With the **preview window focused**:
+
+| Control | Action |
+| --- | --- |
+| `T` | Begin a new timed trial, clearing prior decoder confirmation state/history eligibility. |
+| `L` | Toggle lighting recovery for comparison, then press `T` for a fresh trial. |
+| `S` | Save untouched camera and simulated scanner-input PNGs. |
+| `Q` / Esc | Quit. In the terminal use Ctrl+C. |
+| Brightness slider | 100 is unchanged; 50 halves image brightness. |
+| Blur slider | 0 is unchanged; higher values add Gaussian blur. |
+| Shadow / glare sliders | 0 is unchanged; add a left-to-right shadow or central glare patch. |
+
+The first trial starts automatically. Hold the target and conditions constant
+for the trial duration, then allow up to three seconds for in-flight results.
+Changing a simulation slider or lighting-recovery mode aborts the active trial;
+press `T` to test the new setting. Synthetic effects change the scanner input and
+are explicitly labelled; they are not calibrated reproductions of physical
+lighting, movement or camera exposure. The suggested correction thumbnail is
+illustrative; the reported decoder method identifies the actual successful path.
+
+Test real sunlight, shade, backlight, changing light, motion, oblique angles and
+progressively greater measured distances. Restart with a new `--condition` and
+`--distance-m` for each physical setup. Repeat trials with recovery on/off under
+the same conditions. For labelled negative tests without a target, use the replay
+workflow below with `expected: []`. Use fresh target presentations for independent trials; adjacent frames
+or repeated trials of a continuously stationary target are correlated.
+
+Each timestamped subdirectory contains `session.json`, `samples.jsonl`,
+`trials.jsonl`, `trials.csv`, and `summary.json`. Trials include correct decode and
+confirmation rates per distinct **processed** frame, incorrect payloads, captured
+and processed frame counts, first confirmation completion time, latency p95 and
+minimum successfully decoded pixels/module. A frame captured early but decoded
+after two seconds does not pass the two-second timing check. Results arriving
+after the three-second drain allowance are excluded. Inspect processed/captured
+counts and queue-drop diagnostics when interpreting rates.
+
+The smallest decoded pixel size and farthest measured confirmation are observed
+results, not a guaranteed maximum range. Compare completed trials across runs:
+
+```bash
+python3 diagnostics.py --report diagnostic_runs
+```
+
+`comparison.json` groups condition, distance, simulation settings, recovery,
+expected payload, trial duration and camera/decoder configuration. Confidence
+bounds assume independent trials; a handful of successful trials cannot establish
+99% reliability. The diagnostic display and simulations add overhead, so repeat
+latency measurements in competition mode for the final operating conditions.
+
+Competition mode uses the same improved decoder and lighting recovery, with
+preview, simulations and diagnostic trial recording disabled:
+
+```bash
+python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --competition
+```
+
+Add `--diagnostics` to print performance statistics while remaining headless.
+An individual native decoder call may exceed the scheduling budget. The worker
+now prioritizes the latest frame, skips historical retries after overruns, and
+builds recovery variants only after a direct crop fails; full-frame overruns do
+not permanently starve native-tile discovery.
 
 Raspberry Pi setup and headless competition mode:
 

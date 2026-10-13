@@ -15,6 +15,55 @@ import scanner
 
 
 class ScannerTests(unittest.TestCase):
+    def test_main_thread_capture_reads_and_releases_on_calling_thread(self):
+        owner = threading.get_ident()
+        frame = np.full((24, 32, 3), 100, np.uint8)
+        cap = Mock()
+        def read():
+            self.assertEqual(threading.get_ident(), owner)
+            return True, frame
+        cap.read.side_effect = read
+        with scanner.MainThreadCapture(cap) as capture:
+            self.assertIs(capture.read()[0], frame)
+        cap.release.assert_called_once()
+
+    def test_camera_test_bypasses_decoder_and_saves_unmodified_frame(self):
+        frame = np.full((24, 32, 3), 123, np.uint8)
+        cap = Mock()
+        cap.read.return_value = (True, frame)
+        preview = Mock()
+        preview.show.return_value = False
+        with tempfile.TemporaryDirectory() as directory:
+            args = scanner.make_parser().parse_args(['--camera-test', '--save-frames', directory])
+            with patch.object(scanner, 'open_camera', return_value=cap), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'Preview', return_value=preview), patch.object(scanner.time, 'monotonic', side_effect=[0, 3]), patch.object(scanner, 'QRScanner') as decoder, patch('builtins.print'):
+                self.assertEqual(scanner.camera_test(args), 0)
+            saved = cv2.imread(str(Path(directory) / 'raw_camera.png'))
+            np.testing.assert_array_equal(saved, frame)
+            decoder.assert_not_called()
+        cap.release.assert_called_once()
+        preview.close.assert_called_once()
+
+    def test_frame_metrics_distinguish_black_from_visible_image(self):
+        black = scanner.frame_metrics(np.zeros((20, 20, 3), np.uint8))
+        visible = scanner.frame_metrics(np.full((20, 20, 3), 180, np.uint8))
+        self.assertEqual(black['image_max'], 0)
+        self.assertEqual(visible['image_mean'], 180)
+
+    def test_mac_accepts_negotiated_resolution_and_uses_main_thread_capture(self):
+        frame = np.full((360, 640, 3), 120, np.uint8)
+        capture = Mock()
+        capture.__enter__ = Mock(return_value=capture)
+        capture.__exit__ = Mock(return_value=False)
+        capture.read.return_value = (frame, 0, scanner.datetime.datetime.now().astimezone())
+        preview = Mock()
+        preview.show.side_effect = [True, False]
+        detector = Mock(observations=[])
+        with tempfile.TemporaryDirectory() as directory, patch.object(scanner.sys, 'platform', 'darwin'), patch.object(scanner, 'QRScanner', return_value=detector), patch.object(scanner, 'open_camera'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'MainThreadCapture', return_value=capture) as main_capture, patch.object(scanner, 'LatestFrameCapture') as threaded, patch.object(scanner, 'Preview', return_value=preview), patch('builtins.print') as log:
+            self.assertEqual(scanner.main(['--width', '640', '--height', '480', '--no-resolve-links', '--output', str(Path(directory) / 'scans.jsonl')]), 0)
+            self.assertTrue(any('continuing at its actual resolution' in str(call) for call in log.call_args_list))
+        main_capture.assert_called_once()
+        threaded.assert_not_called()
+
     def test_records_preserve_payload_and_cooldown_per_code(self):
         output = io.StringIO()
         writer = scanner.ScanWriter(output)
@@ -100,7 +149,7 @@ class ScannerTests(unittest.TestCase):
                 capture.read.side_effect = KeyboardInterrupt if interrupted else RuntimeError('no frames')
                 path = Path(directory) / 'scans.jsonl'
                 path.write_text('existing\n')
-                with patch.object(scanner, 'QRScanner'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'open_camera', return_value=cap), patch.object(scanner, 'LatestFrameCapture', return_value=capture), patch('builtins.print'):
+                with patch.object(scanner, 'QRScanner'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'open_camera', return_value=cap), patch.object(scanner, 'LatestFrameCapture', return_value=capture), patch.object(scanner, 'MainThreadCapture', return_value=capture), patch('builtins.print'):
                     code = scanner.main(['--output', str(path), '--no-preview', '--no-resolve-links'])
                 self.assertEqual(code, 0 if interrupted else 1)
                 self.assertEqual(path.read_text(), 'existing\n')
@@ -310,7 +359,7 @@ class ScannerTests(unittest.TestCase):
         preview.show.return_value = False
         resolver = Mock()
         resolver.poll.return_value = []
-        with tempfile.TemporaryDirectory() as directory, patch.object(scanner, 'QRScanner'), patch.object(scanner, 'open_camera'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'LatestFrameCapture', return_value=capture), patch.object(scanner, 'Preview', return_value=preview), patch.object(scanner, 'LinkResolver', return_value=resolver):
+        with tempfile.TemporaryDirectory() as directory, patch.object(scanner, 'QRScanner'), patch.object(scanner, 'open_camera'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'LatestFrameCapture', return_value=capture), patch.object(scanner, 'MainThreadCapture', return_value=capture), patch.object(scanner, 'Preview', return_value=preview), patch.object(scanner, 'LinkResolver', return_value=resolver):
             self.assertEqual(scanner.main(['--output', str(Path(directory) / 'scans.jsonl')]), 0)
         capture.__exit__.assert_called_once()
         preview.close.assert_called_once()

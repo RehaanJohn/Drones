@@ -136,7 +136,7 @@ class TrackingDecoder:
         return track
 
     def _decode_view(self, view, offset, scale, method, frame, frame_id, stamp, captured_at,
-                     known_points=None):
+                     known_points=None, deadline=None):
         decoded = False
         def record(text, points):
             nonlocal decoded
@@ -155,12 +155,15 @@ class TrackingDecoder:
                 points = np.float32([[p.x, p.y] for p in
                                     (position.top_left, position.top_right, position.bottom_right, position.bottom_left)])
                 record(result.text, points)
-        if not decoded:
+        within_budget = lambda: deadline is None or time.perf_counter() < deadline
+        if not decoded and within_budget():
             self.owner.detector.setScaleFactor(scale)
             texts, corners = self.owner.detector.detectAndDecode(view)
             for i, text in enumerate(texts):
                 record(text, corners[i] if i < len(corners) else None)
-        if not decoded and known_points is not None:
+                if not text and i < len(corners) and known_points is None:
+                    self._associate(np.asarray(corners[i], np.float32).reshape(4, 2) + offset, stamp)
+        if not decoded and known_points is not None and within_budget():
             text, _, _ = self.owner.qr.detectAndDecode(view)
             record(text, known_points)
         return decoded
@@ -190,13 +193,14 @@ class TrackingDecoder:
         frame_id = self.sequence if frame_id is None else frame_id
         stamp = time.monotonic() if timestamp is None else timestamp
         started = time.perf_counter()
+        deadline = started + self.budget
         self.observations = []
         attempted = 0
         forward = self._move_tracks(frame, stamp)
         if not forward:
             # Re-localize historical frames; never use current corners to crop an old image.
             self._decode_view(frame, (0, 0), min(1, 640 / max(frame.shape[:2])), 'history',
-                              frame, frame_id, stamp, captured_at)
+                              frame, frame_id, stamp, captured_at, deadline=deadline)
         else:
             # Existing candidates get the first 75% of the scheduling window.
             self._recover(frame, frame_id, stamp, captured_at, started + self.budget * .75)
@@ -204,17 +208,22 @@ class TrackingDecoder:
             self.discovery_credit = min(self.budget, self.discovery_credit + self.budget * .25)
             discovery_start = time.perf_counter()
             discover = self.discovery_credit > 0 or not self.tracks
-            if not self.tracks:
+            # Alternate full-frame discovery and native tiles when full-frame calls overrun.
+            # This keeps distant/small symbols from starving behind repeated full scans.
+            if not self.tracks and (self.sequence % 2 or not self.owner.tiles_per_frame):
                 self._decode_view(frame, (0, 0), min(1, 640 / max(frame.shape[:2])), 'full',
-                                  frame, frame_id, stamp, captured_at)
+                                  frame, frame_id, stamp, captured_at, deadline=deadline)
             regions = self.tiles(frame.shape, self.owner.tile_size)
             attempted = 0
-            while discover and attempted < self.owner.tiles_per_frame and (attempted == 0 or time.perf_counter() - discovery_start < self.discovery_credit):
+            while discover and attempted < self.owner.tiles_per_frame and time.perf_counter() < deadline and (attempted == 0 or time.perf_counter() - discovery_start < self.discovery_credit):
                 x1, y1, x2, y2 = regions[self.owner.cursor % len(regions)]
                 self.owner.cursor += 1
                 attempted += 1
                 tile = frame[y1:y2, x1:x2]
-                self._decode_view(tile, (x1, y1), 1, 'tile', frame, frame_id, stamp, captured_at)
+                decoded = self._decode_view(tile, (x1, y1), 1, 'tile', frame, frame_id, stamp, captured_at,
+                                            deadline=deadline)
+                if decoded or time.perf_counter() >= deadline:
+                    continue
                 gray = tile if tile.ndim == 2 else cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
                 found, corners = self.owner.qr.detectMulti(gray)
                 if found and corners is not None:
@@ -223,11 +232,18 @@ class TrackingDecoder:
                 # A localizer can fail under shadow too. One measured tile variant is a discovery fallback.
                 if self.owner.lighting and not found and time.perf_counter() - started < self.budget:
                     mode, corrected = variants(tile, quality(tile, self.modules), self.modules)[0]
-                    self._decode_view(corrected, (x1, y1), 1, 'search/' + mode, frame, frame_id, stamp, captured_at)
+                    self._decode_view(corrected, (x1, y1), 1, 'search/' + mode, frame, frame_id, stamp, captured_at,
+                                      deadline=deadline)
             if discover:
                 self.discovery_credit -= time.perf_counter() - discovery_start
             self._recover(frame, frame_id, stamp, captured_at, started + self.budget)
-        self.owner.last_stats = {'decode_ms': round((time.perf_counter() - started) * 1000, 2),
+        # Localization is useful diagnostic evidence even when recovery ran out of time.
+        for track in self.tracks if forward else ():
+            if not any(o['track_id'] == track.id for o in self.observations):
+                self._record('', track.corners, 'candidate', frame, frame_id, stamp, captured_at)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        self.owner.last_stats = {'decode_ms': round(elapsed_ms, 2),
+                                 'budget_overrun_ms': round(max(0, elapsed_ms - self.budget * 1000), 2),
                                  'tracks': len(self.tracks), 'methods': sorted({o['method'] for o in self.observations}),
                                  'tiles': attempted,
                                  'budget_ms': self.budget * 1000}
@@ -246,7 +262,13 @@ class TrackingDecoder:
                 continue
             metrics = quality(crop, self.modules)
             self._record('', track.corners, 'candidate', frame, frame_id, stamp, captured_at)
-            views = [('crop', crop)]
+            # Most tracked codes decode directly; build expensive recovery images only on failure.
+            if self._decode_view(crop, (0, 0), 1, 'crop', frame, frame_id, stamp, captured_at,
+                                 track.corners, deadline):
+                continue
+            if time.perf_counter() >= deadline:
+                break
+            views = []
             warped = rectified(frame, track.corners)
             if warped is not None:
                 views.append(('rectified', warped))
@@ -255,5 +277,5 @@ class TrackingDecoder:
             for name, view in views:
                 if time.perf_counter() >= deadline:
                     break
-                if self._decode_view(view, (0, 0), 1, name, frame, frame_id, stamp, captured_at, track.corners):
+                if self._decode_view(view, (0, 0), 1, name, frame, frame_id, stamp, captured_at, track.corners, deadline):
                     break

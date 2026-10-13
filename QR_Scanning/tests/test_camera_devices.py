@@ -11,6 +11,21 @@ import cv2
 
 
 class CameraDiscoveryTests(unittest.TestCase):
+    def test_mac_listing_uses_avfoundation(self):
+        device = SimpleNamespace(index=1, name='MacBook Air Camera', backend=cv2.CAP_AVFOUNDATION)
+        enumerate_cameras = Mock(return_value=[device])
+        module = SimpleNamespace(enumerate_cameras=enumerate_cameras)
+        with patch.object(camera_devices.sys, 'platform', 'darwin'), patch.dict(sys.modules, {'cv2_enumerate_cameras': module}):
+            self.assertEqual(camera_devices.list_cameras('avfoundation'), [device])
+        enumerate_cameras.assert_called_once_with(cv2.CAP_AVFOUNDATION)
+
+    def test_mac_default_prefers_builtin_over_continuity_camera(self):
+        phone = SimpleNamespace(index=0, name='Phone Camera', backend=cv2.CAP_AVFOUNDATION)
+        builtin = SimpleNamespace(index=1, name='MacBook Air Camera', backend=cv2.CAP_AVFOUNDATION)
+        with patch.object(camera_devices.sys, 'platform', 'darwin'), patch.object(camera_devices, 'list_cameras', return_value=[phone, builtin]), patch.object(camera_devices, 'probe_camera', return_value=True) as probe:
+            self.assertIs(camera_devices.find_working_camera('avfoundation'), builtin)
+        probe.assert_called_once_with(1, cv2.CAP_AVFOUNDATION)
+
     def test_skips_non_delivering_device_and_ir_camera(self):
         cameras = [SimpleNamespace(index=2, name='Lenovo IR Camera', backend=cv2.CAP_MSMF),
                    SimpleNamespace(index=0, name='Lenovo RGB Camera', backend=cv2.CAP_MSMF),

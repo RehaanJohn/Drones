@@ -202,8 +202,9 @@ class ProcessCapture:
 
 
 class DecoderWorker:
-    def __init__(self, detector, interval=.1):
+    def __init__(self, detector, interval=.1, diagnostics=False):
         self.detector, self.interval = detector, interval
+        self.diagnostics = diagnostics
         self.input, self.results = queue.Queue(1), queue.Queue(2)
         self.stop = threading.Event()
         self.error = None
@@ -212,6 +213,11 @@ class DecoderWorker:
         self.dropped_results = 0
         self.thread = threading.Thread(target=self._run, name='qr-decode', daemon=True)
         self.seen = deque(maxlen=128)
+        self.settings = queue.Queue(1)
+        self.minimum_stamp = None
+
+    def set_lighting(self, enabled, since=None):
+        replace_latest(self.settings, (bool(enabled), since))
 
     def __enter__(self):
         self.thread.start()
@@ -229,6 +235,18 @@ class DecoderWorker:
                     continue
                 if not history:
                     continue
+                try:
+                    lighting, self.minimum_stamp = self.settings.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    self.detector.lighting = lighting
+                    self.detector.reset()
+                    self.seen.clear()
+                if self.minimum_stamp is not None:
+                    history = tuple(item for item in history if item[1] >= self.minimum_stamp)
+                    if not history:
+                        continue
                 started = time.monotonic()
                 latest = history[-1]
                 candidates = [latest]
@@ -241,24 +259,45 @@ class DecoderWorker:
                         regions = [image[::4, ::4]]
                     scores = []
                     for region in regions:
+                        step = max(1, int(np.ceil(max(region.shape[:2]) / 160)))
+                        region = region[::step, ::step]
                         gray = region if region.ndim == 2 else cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
                         low, high = np.percentile(gray, (5, 95))
                         scores.append(float(np.log1p(cv2.Laplacian(gray, cv2.CV_32F).var()) * (high - low)))
                     return max(scores)
+                # Score a bounded handful of old frames, after the current frame gets its turn.
                 older = [item for item in history[:-1] if item[0] not in self.seen]
-                if older:
-                    candidates.append(max(older, key=score))
                 all_observations = []
+                processed = []
                 for sequence, stamp, captured, frame in candidates:
                     if sequence in self.seen or self.stop.is_set():
                         continue
-                    if all_observations and time.monotonic() - started >= self.detector.tracker.budget:
+                    if processed and time.monotonic() - started >= self.detector.tracker.budget:
                         break
                     self.seen.append(sequence)
                     all_observations.extend(self.detector.observe(frame, sequence, stamp, captured))
+                    processed.append({'frame_id': sequence, 'capture_monotonic': stamp,
+                                      'latency_ms': (time.monotonic() - stamp) * 1000,
+                                      'decode_ms': self.detector.last_stats.get('decode_ms', 0)})
+                    if self.diagnostics:
+                        if __package__:
+                            from .tracking import quality
+                        else:
+                            from tracking import quality
+                        step = max(1, int(np.ceil(max(frame.shape[:2]) / 320)))
+                        processed[-1]['image_quality'] = quality(frame[::step, ::step])
+                    if len(processed) == 1 and older and time.monotonic() - started < self.detector.tracker.budget:
+                        # Downsample ROI scoring as well as full-frame scoring.
+                        candidates.append(max(older[-3:], key=score))
                 self.observations = all_observations
-                self.stats = dict(self.detector.last_stats, worker_ms=(time.monotonic() - started) * 1000,
-                                  frame_age_ms=(time.monotonic() - latest[1]) * 1000)
+                completed = time.monotonic()
+                for item in processed:
+                    item['result_monotonic'] = completed
+                    item['latency_ms'] = (completed - item['capture_monotonic']) * 1000
+                self.stats = dict(self.detector.last_stats, worker_ms=(completed - started) * 1000,
+                                  frame_age_ms=(completed - latest[1]) * 1000,
+                                  processed_frames=processed, completed_monotonic=completed)
+                self.stats['worker_budget_overrun_ms'] = max(0, self.stats['worker_ms'] - self.detector.tracker.budget * 1000)
                 # Bound output and make drops observable, without stalling capture or preview.
                 try:
                     self.results.put_nowait((all_observations, self.stats))
@@ -335,11 +374,16 @@ def overlay(frame, observations):
         if observation['corners'] is None:
             continue
         points = np.array(observation['corners'], np.int32)
-        color = (0, 200, 0) if observation['confirmed'] else (0, 180, 255)
+        color = (0, 200, 0) if observation['confirmed'] else ((255, 200, 0) if observation['payload'] else (0, 180, 255))
         cv2.polylines(image, [points], True, color, 2)
         q = observation['quality']
-        label = f"#{observation['track_id']} {'confirmed' if observation['confirmed'] else 'candidate'} contrast={q['contrast']:.0f} ppm~{q['module_px_estimate']:.1f}"
-        cv2.putText(image, label, tuple(points[0]), cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
+        status = 'confirmed' if observation['confirmed'] else ('decoded' if observation['payload'] else 'candidate')
+        label = f"#{observation['track_id']} {status} contrast={q['contrast']:.0f} px/module~{q['module_px_estimate']:.1f}"
+        label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .5, 1)
+        x = min(max(0, int(points[:, 0].min())), max(0, image.shape[1] - label_size[0] - 4))
+        y = min(max(label_size[1] + 4, int(points[:, 1].min()) - 5), image.shape[0] - baseline - 1)
+        cv2.rectangle(image, (x, y - label_size[1] - 3), (x + label_size[0] + 3, y + baseline), (20,20,20), -1)
+        cv2.putText(image, label, (x + 1, y), cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
     return image
 
 

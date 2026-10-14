@@ -13,6 +13,10 @@ import time
 import cv2
 import numpy as np
 
+SHM_SLOTS = 6
+DYNAMIC_KEYS = ('actual_size', 'measured_fps', 'read_and_decompress_ms', 'capture_count',
+                'capture_cpu_percent', 'last_exposure_change_monotonic')
+
 
 def replace_latest(channel, value):
     try:
@@ -48,13 +52,33 @@ class FrameHistory:
         return tuple(self.frames)
 
 
+def _attach_shm(name):
+    from multiprocessing import shared_memory
+    try:
+        return shared_memory.SharedMemory(name=name, track=False)   # Python 3.13+: parent owns cleanup
+    except TypeError:
+        return shared_memory.SharedMemory(name=name)
+
+
+def _enable_gray_capture(cap):
+    """Ask V4L2 for raw MJPEG bytes so we can decode straight to grayscale (skips color work)."""
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+    for _ in range(3):
+        ok, probe = cap.read()
+        if ok and probe is not None and probe.dtype == np.uint8 and probe.ndim == 2 and probe.shape[0] == 1:
+            if cv2.imdecode(probe.reshape(-1), cv2.IMREAD_GRAYSCALE) is not None:
+                return True
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+    return False
+
+
 def _linux_capture(options, channel, commands):
     # Imported only inside the spawned child; the parent can terminate any stalled native call.
     if __package__:
         from . import linux_camera
     else:
         import linux_camera
-    cap = None
+    cap = shm = None
     try:
         device = options.get('device')
         if device is None and options.get('camera') is not None:
@@ -68,12 +92,24 @@ def _linux_capture(options, channel, commands):
         if not cap.isOpened():
             raise RuntimeError('Could not open ' + profile['device'])
         profile = linux_camera.configure(cap, profile, options)
+        gray_mode = bool(options.get('gray_capture')) and _enable_gray_capture(cap)
+        if options.get('gray_capture'):
+            print('Grayscale MJPEG capture ' + ('enabled' if gray_mode else 'unavailable; using color capture'),
+                  file=sys.stderr, flush=True)
+        if options.get('shm_name'):
+            try:
+                shm = _attach_shm(options['shm_name'])
+            except Exception:
+                shm = None   # fall back to sending frames through the queue
+        slots, slot_bytes = options.get('shm_slots', SHM_SLOTS), options.get('shm_slot_bytes', 0)
         started, count, failures = time.monotonic(), 0, 0
         cpu_started = time.process_time()
-        next_control = 0
+        next_control = next_profile = 0
         while True:
             begin = time.monotonic()
             ok, frame = cap.read()
+            if ok and gray_mode and frame is not None:
+                frame = cv2.imdecode(frame.reshape(-1), cv2.IMREAD_GRAYSCALE)
             end = time.monotonic()
             if not ok or frame is None or not frame.size:
                 failures += 1
@@ -107,8 +143,19 @@ def _linux_capture(options, channel, commands):
                             profile['applied_controls']['exposure_absolute'] = linux_camera.set_control(
                                 profile['device'], 'exposure_absolute', value, controls)
                             profile['last_exposure_change_monotonic'] = end
-                            next_control = end + .5
-            replace_latest(channel, ('frame', frame, end, datetime.datetime.now().astimezone(), profile))
+                            next_control, next_profile = end + .5, 0
+            # The full profile (mode tables, raw v4l2 text) is large: send it rarely, not per frame.
+            full = None
+            if end >= next_profile:
+                full, next_profile = profile, end + 2
+            dynamic = {key: profile[key] for key in DYNAMIC_KEYS if key in profile}
+            captured = datetime.datetime.now().astimezone()
+            if shm is not None and frame.nbytes <= slot_bytes:
+                slot = count % slots
+                np.ndarray(frame.shape, np.uint8, buffer=shm.buf, offset=slot * slot_bytes)[...] = frame
+                replace_latest(channel, ('shm', (slot, frame.shape), end, captured, full, dynamic))
+            else:
+                replace_latest(channel, ('frame', frame, end, captured, full, dynamic))
     except Exception as exc:
         # Errors must survive queue pressure. The parent continues consuming while this bounded put waits.
         try:
@@ -118,15 +165,26 @@ def _linux_capture(options, channel, commands):
     finally:
         if cap is not None:
             cap.release()
+        if shm is not None:
+            try:
+                shm.close()
+            except BufferError:
+                pass
 
 
 class ProcessCapture:
-    """Linux driver ownership in a killable process, with at most three restarts."""
+    """Linux driver ownership in a killable process, with at most three restarts.
+
+    Frames travel through shared memory; only a small message crosses the queue, which avoids
+    pickling ~6 MB per frame on a Pi.
+    """
     def __init__(self, options, timeout=5, retries=3):
         self.options = dict(options)
         self.timeout, self.retries = timeout, retries
         self.process = self.channel = None
         self.commands = None
+        self.shm = None
+        self.slot_bytes = 0
         self.profile = None
         self.restart_count = 0
         self.captured_monotonic = 0
@@ -135,9 +193,18 @@ class ProcessCapture:
 
     def _start(self):
         self.received_since_restart = 0
+        options = dict(self.options)
+        self.slot_bytes = options['width'] * options['height'] * 3
+        try:
+            from multiprocessing import shared_memory
+            self.shm = shared_memory.SharedMemory(create=True, size=SHM_SLOTS * self.slot_bytes)
+            options.update(shm_name=self.shm.name, shm_slots=SHM_SLOTS, shm_slot_bytes=self.slot_bytes)
+        except (OSError, ValueError, ImportError):
+            self.shm = None
+            options['shm_name'] = None
         self.channel = self.context.Queue(maxsize=2)
         self.commands = self.context.Queue(maxsize=1)
-        self.process = self.context.Process(target=_linux_capture, args=(self.options, self.channel, self.commands), daemon=True)
+        self.process = self.context.Process(target=_linux_capture, args=(options, self.channel, self.commands), daemon=True)
         self.process.start()
 
     def _close(self):
@@ -155,6 +222,16 @@ class ProcessCapture:
         if self.commands is not None:
             self.commands.cancel_join_thread()
             self.commands.close()
+        if self.shm is not None:
+            try:
+                self.shm.close()
+            except BufferError:
+                pass
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
+            self.shm = None
         self.process = self.channel = None
         self.commands = None
 
@@ -181,9 +258,20 @@ class ProcessCapture:
                 message = self.channel.get(timeout=self.timeout if timeout is None else timeout)
                 if message[0] == 'error':
                     raise RuntimeError(message[1])
-                _, frame, stamp, captured, self.profile = message
-                self.received_since_restart += 1
-                self.profile['capture_queue_drops'] = max(0, self.profile['capture_count'] - self.received_since_restart)
+                kind, payload, stamp, captured, full, dynamic = message
+                if kind == 'shm':
+                    slot, shape = payload
+                    view = np.ndarray(shape, np.uint8, buffer=self.shm.buf, offset=slot * self.slot_bytes)
+                    frame = view.copy()
+                    del view
+                else:
+                    frame = payload
+                if full is not None:
+                    self.profile = full
+                if self.profile is not None:
+                    self.profile.update(dynamic)
+                    self.received_since_restart += 1
+                    self.profile['capture_queue_drops'] = max(0, self.profile.get('capture_count', 0) - self.received_since_restart)
                 self.captured_monotonic = stamp
                 self.candidates.clear()  # Once selected, reconnect only to this camera identity.
                 return frame, (time.monotonic() - stamp) * 1000, captured
@@ -226,6 +314,22 @@ class DecoderWorker:
     def submit(self, history):
         replace_latest(self.input, history)
 
+    def _score(self, image):
+        """Cheap sharpness of tracked ROIs (or a downsampled frame) to pick the best skipped frame."""
+        tracker = self.detector.tracker
+        regions = [tracker.crop(image, t.corners) for t in tracker.tracks]
+        regions = [r for r in regions if r is not None and r.size]
+        if not regions:
+            regions = [image[::4, ::4]]
+        scores = []
+        for region in regions:
+            step = max(1, int(np.ceil(max(region.shape[:2]) / 160)))
+            region = region[::step, ::step]
+            gray = region if region.ndim == 2 else cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            low, high = np.percentile(gray, (5, 95))
+            scores.append(float(np.log1p(cv2.Laplacian(gray, cv2.CV_32F).var()) * (high - low)))
+        return max(scores)
+
     def _run(self):
         try:
             while not self.stop.is_set():
@@ -245,62 +349,39 @@ class DecoderWorker:
                     self.seen.clear()
                 if self.minimum_stamp is not None:
                     history = tuple(item for item in history if item[1] >= self.minimum_stamp)
-                    if not history:
-                        continue
+                unseen = [item for item in history if item[0] not in self.seen]
+                if not unseen:
+                    continue
                 started = time.monotonic()
-                latest = history[-1]
-                candidates = [latest]
-                # Score history using tracked ROIs where available. Re-localize the chosen old frame.
-                def score(item):
-                    image = item[3]
-                    regions = [self.detector.tracker.crop(image, t.corners) for t in self.detector.tracker.tracks]
-                    regions = [r for r in regions if r is not None and r.size]
-                    if not regions:
-                        regions = [image[::4, ::4]]
-                    scores = []
-                    for region in regions:
-                        step = max(1, int(np.ceil(max(region.shape[:2]) / 160)))
-                        region = region[::step, ::step]
-                        gray = region if region.ndim == 2 else cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-                        low, high = np.percentile(gray, (5, 95))
-                        scores.append(float(np.log1p(cv2.Laplacian(gray, cv2.CV_32F).var()) * (high - low)))
-                    return max(scores)
-                # Score a bounded handful of old frames, after the current frame gets its turn.
-                older = [item for item in history[:-1] if item[0] not in self.seen]
-                all_observations = []
-                processed = []
-                for sequence, stamp, captured, frame in candidates:
-                    if sequence in self.seen or self.stop.is_set():
-                        continue
-                    if processed and time.monotonic() - started >= self.detector.tracker.budget:
-                        break
-                    self.seen.append(sequence)
-                    all_observations.extend(self.detector.observe(frame, sequence, stamp, captured))
-                    processed.append({'frame_id': sequence, 'capture_monotonic': stamp,
-                                      'latency_ms': (time.monotonic() - stamp) * 1000,
-                                      'decode_ms': self.detector.last_stats.get('decode_ms', 0)})
-                    if self.diagnostics:
-                        if __package__:
-                            from .tracking import quality
-                        else:
-                            from tracking import quality
-                        step = max(1, int(np.ceil(max(frame.shape[:2]) / 320)))
-                        processed[-1]['image_quality'] = quality(frame[::step, ::step])
-                    if len(processed) == 1 and older and time.monotonic() - started < self.detector.tracker.budget:
-                        # Downsample ROI scoring as well as full-frame scoring.
-                        candidates.append(max(older[-3:], key=score))
-                self.observations = all_observations
+                latest = unseen[-1]
+                chosen = latest
+                # When decoding is slower than capture, frames get skipped: of the newest few,
+                # decode the sharpest instead of blindly the last (latest wins ties).
+                if len(unseen) > 1 and self.detector.tracker.tracks:
+                    chosen = max(reversed(unseen[-3:]), key=lambda item: self._score(item[3]))
+                for item in unseen:
+                    self.seen.append(item[0])
+                sequence, stamp, captured, frame = chosen
+                observations = list(self.detector.observe(frame, sequence, stamp, captured))
                 completed = time.monotonic()
-                for item in processed:
-                    item['result_monotonic'] = completed
-                    item['latency_ms'] = (completed - item['capture_monotonic']) * 1000
+                processed = {'frame_id': sequence, 'capture_monotonic': stamp,
+                             'latency_ms': (completed - stamp) * 1000, 'result_monotonic': completed,
+                             'decode_ms': self.detector.last_stats.get('decode_ms', 0)}
+                if self.diagnostics:
+                    if __package__:
+                        from .tracking import quality
+                    else:
+                        from tracking import quality
+                    step = max(1, int(np.ceil(max(frame.shape[:2]) / 320)))
+                    processed['image_quality'] = quality(frame[::step, ::step])
+                self.observations = observations
                 self.stats = dict(self.detector.last_stats, worker_ms=(completed - started) * 1000,
-                                  frame_age_ms=(completed - latest[1]) * 1000,
-                                  processed_frames=processed, completed_monotonic=completed)
+                                  frame_age_ms=(completed - stamp) * 1000,
+                                  processed_frames=[processed], completed_monotonic=completed)
                 self.stats['worker_budget_overrun_ms'] = max(0, self.stats['worker_ms'] - self.detector.tracker.budget * 1000)
                 # Bound output and make drops observable, without stalling capture or preview.
                 try:
-                    self.results.put_nowait((all_observations, self.stats))
+                    self.results.put_nowait((observations, self.stats))
                 except queue.Full:
                     self.dropped_results += 1
                 self.stop.wait(max(0, self.interval - (time.monotonic() - started)))
@@ -370,6 +451,8 @@ class OutputWorker:
 
 def overlay(frame, observations):
     image = frame.copy()
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     for observation in observations:
         if observation['corners'] is None:
             continue
@@ -378,7 +461,7 @@ def overlay(frame, observations):
         cv2.polylines(image, [points], True, color, 2)
         q = observation['quality']
         status = 'confirmed' if observation['confirmed'] else ('decoded' if observation['payload'] else 'candidate')
-        label = f"#{observation['track_id']} {status} contrast={q['contrast']:.0f} px/module~{q['module_px_estimate']:.1f}"
+        label = f"#{observation['track_id']} {status} {observation['method']} px/module~{q['module_px_estimate']:.1f}"
         label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .5, 1)
         x = min(max(0, int(points[:, 0].min())), max(0, image.shape[1] - label_size[0] - 4))
         y = min(max(label_size[1] + 4, int(points[:, 1].min()) - 5), image.shape[0] - baseline - 1)

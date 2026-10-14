@@ -145,13 +145,18 @@ def preprocess_for_fallback(image, clahe=None):
     return clahe.apply(grayscale(image))
 
 
-def read_zxing(image):
+def read_zxing(image, try_rotate=False, try_invert=False, try_downscale=True):
+    """Decode QR codes with ZXing.
+
+    QR finder patterns are rotation invariant, so try_rotate only repeats work; try_invert
+    doubles it for inverted symbols that are not expected. Both are opt-in.
+    """
     if zxingcpp is None:
         return []
     # Plain text preserves newlines/Unicode instead of HRI display formatting.
     return [result.text for result in zxingcpp.read_barcodes(
-        image, formats=zxingcpp.BarcodeFormat.QRCode,
-        try_rotate=True, try_downscale=True, try_invert=True,
+        np.ascontiguousarray(image), formats=zxingcpp.BarcodeFormat.QRCode,
+        try_rotate=try_rotate, try_downscale=try_downscale, try_invert=try_invert,
         text_mode=zxingcpp.TextMode.Plain,
     ) if result.valid and result.text]
 
@@ -302,15 +307,16 @@ class LegacyQRScanner:
 
 
 class QRScanner(LegacyQRScanner):
-    """Compatibility payload API plus structured, two-frame-confirmed observations."""
+    """Compatibility payload API plus structured observations from the ROI-first tracker."""
     def __init__(self, detector=None, tile_size=640, tiles_per_frame=2,
-                 use_zxing=True, lighting=True, budget_ms=150, modules=29):
+                 use_zxing=True, lighting=True, budget_ms=150, modules=29, **tracker_options):
         super().__init__(detector, tile_size, tiles_per_frame, use_zxing, lighting)
         if __package__:
             from .tracking import TrackingDecoder
         else:
             from tracking import TrackingDecoder
-        self.tracker = TrackingDecoder(self, zxingcpp, crop_qr_region, tile_regions, budget_ms, modules)
+        self.tracker = TrackingDecoder(self, zxingcpp, crop_qr_region, tile_regions, budget_ms, modules,
+                                       **tracker_options)
 
     def decode(self, frame):
         # Still-image callers retain provisional payloads; live runtime uses observe().
@@ -477,7 +483,7 @@ class MainThreadCapture:
 
 
 def frame_metrics(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return {'image_mean': round(float(gray.mean()), 2),
             'image_min': int(gray.min()), 'image_max': int(gray.max()),
             'image_std': round(float(gray.std()), 2)}
@@ -651,6 +657,12 @@ def make_parser():
     parser.add_argument("--max-exposure-us", type=int, default=2000, help="Motion-calibrated exposure ceiling for adaptive control")
     parser.add_argument("--budget-ms", type=float, default=150, help="Decoder scheduling budget; native calls may overrun")
     parser.add_argument("--qr-modules", type=int, default=29, help="Actual QR symbol modules per side (without quiet zone); default estimate 29")
+    parser.add_argument("--confirm-frames", type=int, default=1, help="Distinct frames that must agree before a payload is reported. QR error correction already validates a decode, so 1 maximizes range; use 2 to demand repetition")
+    parser.add_argument("--max-candidates", type=int, default=4, help="Localizer candidates examined per frame")
+    parser.add_argument("--target-ppm", type=float, default=5.0, help="Pixels per module that small candidates are upscaled toward before decoding")
+    parser.add_argument("--discovery-every", type=int, default=3, help="While candidates exist but nothing decodes, run full-frame/tile discovery every N frames")
+    parser.add_argument("--try-invert", action="store_true", help="Also look for inverted (light-on-dark) QR codes; doubles ZXing work")
+    parser.add_argument("--gray-capture", action="store_true", help="Linux: decode MJPEG straight to grayscale and skip color conversion (not with --diagnostics)")
     parser.add_argument("--log-observations", action="store_true", help="Include provisional geometry/quality records in JSONL")
     parser.add_argument("--list-cameras", action="store_true", help="List current camera names, indices/devices, and backends")
     parser.add_argument("--backend", choices=("auto", "msmf", "dshow", "avfoundation", "v4l2", "any"),
@@ -666,7 +678,7 @@ def make_parser():
     parser.add_argument("--focus", type=float, help="Raw manual focus value; use --autofocus 0")
     parser.add_argument("--gain", type=float, help="Raw camera gain value")
     parser.add_argument("--tile-size", type=int, default=640, help="Native-resolution tile edge (>=128)")
-    parser.add_argument("--tiles-per-frame", type=int, default=2, help="Rolling tiles per scan; 0 disables recovery")
+    parser.add_argument("--tiles-per-frame", type=int, default=2, help="Rolling tiles per discovery pass; 0 disables tile discovery")
     parser.add_argument("--interval", type=float, default=SCAN_INTERVAL, help="Minimum seconds between scan starts")
     parser.add_argument("--no-zxing", action="store_true", help="Use OpenCV decoders only")
     parser.add_argument("--no-lighting", action="store_true", help="Disable lighting variants for comparisons")
@@ -696,6 +708,9 @@ def main(argv=None):
             or args.tiles_per_frame < 0 or not math.isfinite(args.budget_ms) or args.budget_ms <= 0
             or args.qr_modules < 21 or args.qr_modules > 177 or (args.qr_modules - 21) % 4):
         parser.error('Invalid dimensions, frame rate, scan budget, interval, tiles, or QR module count')
+    if args.confirm_frames < 1 or args.max_candidates < 1 or args.discovery_every < 1 \
+            or not math.isfinite(args.target_ppm) or args.target_ppm <= 0:
+        parser.error('--confirm-frames, --max-candidates and --discovery-every must be >= 1; --target-ppm must be positive')
     if args.fourcc and len(args.fourcc) != 4:
         parser.error('--fourcc must be exactly four characters')
     if not math.isfinite(args.trial_seconds) or args.trial_seconds <= 0 or (args.distance_m is not None and
@@ -710,6 +725,8 @@ def main(argv=None):
         if value is not None and not math.isfinite(value):
             parser.error(f'--{name} must be finite')
     linux = sys.platform.startswith('linux')
+    if args.gray_capture and (not linux or args.diagnostics):
+        parser.error('--gray-capture requires Linux and cannot be combined with --diagnostics')
     if args.camera_test and (linux or args.competition or args.no_preview):
         parser.error('--camera-test requires a desktop camera with preview enabled')
     if not linux and (args.device or args.inspect_camera or args.exposure_us or args.profile_dir or args.adaptive_exposure):
@@ -739,7 +756,10 @@ def main(argv=None):
             args.save_frames.mkdir(parents=True, exist_ok=True)
         detector = QRScanner(tile_size=args.tile_size, tiles_per_frame=args.tiles_per_frame,
                              use_zxing=not args.no_zxing, lighting=not args.no_lighting,
-                             budget_ms=args.budget_ms, modules=args.qr_modules)
+                             budget_ms=args.budget_ms, modules=args.qr_modules,
+                             confirm_frames=args.confirm_frames, invert=args.try_invert,
+                             max_candidates=args.max_candidates, discovery_every=args.discovery_every,
+                             target_ppm=args.target_ppm)
         if linux:
             source = ProcessCapture(vars(args))
         else:

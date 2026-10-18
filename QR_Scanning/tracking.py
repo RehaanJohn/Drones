@@ -4,7 +4,7 @@ Per frame:
   1. CandidateFinder: cheap native-resolution localizer (dense two-direction edge energy).
   2. Each candidate ROI is decoded on its own crop. On failure the crop is enhanced with a
      rotating ladder of recipes (upscale, WeChat CNN+SR, multi-frame fusion, lighting fixes...).
-  3. Only if nothing was decoded does the scanner fall back to full-frame / rolling-tile discovery.
+  3. Periodic full-frame / rolling-tile discovery preserves coverage even after a successful decode.
 """
 from collections import deque
 from dataclasses import dataclass, field
@@ -18,6 +18,7 @@ TRACK_TTL = 0.75      # seconds a candidate survives without being localized or 
 MAX_TRACKS = 8
 ROI_PAD = 0.30        # padding around a candidate; doubles as the quiet zone for the decoder
 HEAVY = ('wechat', 'fuse', 'clahe', 'shadow', 'sharpen', 'rectify', 'adaptive')
+LIGHTING_RECIPES = frozenset(('clahe', 'shadow', 'sharpen', 'adaptive'))
 
 
 def quality(image, modules=29):
@@ -89,7 +90,7 @@ def roi_rect(shape, corners, pad=ROI_PAD):
 class CandidateFinder:
     """Localize QR-like regions without decoding anything.
 
-    A QR symbol is the one common object with dense edges in BOTH directions. We take Sobel
+    QR symbols and some background textures have dense edges in BOTH directions. We take Sobel
     magnitude at native resolution (so a tiny distant code keeps its energy), block-average it,
     keep min(gx, gy) so 1-D barcodes, lines and single edges are suppressed, then threshold and
     group blocks. This costs a few ms and only has to be roughly right: a false candidate costs
@@ -109,9 +110,12 @@ class CandidateFinder:
         ex = cv2.resize(cv2.convertScaleAbs(gx, alpha=.25), (bw, bh), interpolation=cv2.INTER_AREA)
         ey = cv2.resize(cv2.convertScaleAbs(gy, alpha=.25), (bw, bh), interpolation=cv2.INTER_AREA)
         score = np.minimum(ex, ey)
-        top = float(np.percentile(score, 99.7))
-        if top < self.min_score:
+        # A distant symbol may occupy far less than 0.3% of the frame. Estimate
+        # contrast from active cells, not a percentile dominated by empty sky/paper.
+        active = score[score >= self.min_score]
+        if not active.size:
             return []
+        top = float(np.percentile(active, 90))
         threshold = max(self.min_score, .4 * top)
         for _ in range(3):
             mask = (score >= threshold).astype(np.uint8)
@@ -183,6 +187,8 @@ class Track:
     fails: int = 0
     rot: int = 0                          # position in the HEAVY recipe rotation
     last_decode: float = float('-inf')
+    last_method: str = ''
+    last_service: int = -1
     payload_frames: dict = field(default_factory=dict)
     crops: deque = field(default_factory=lambda: deque(maxlen=4))
 
@@ -218,6 +224,7 @@ class TrackingDecoder:
         self.sequence = 0
         self.idle = 0
         self.observations = []
+        self.full_ms = 0.0
 
     # ------------------------------------------------------------------ tracks
     def _associate(self, points, stamp, refresh=True, score=0.0):
@@ -280,7 +287,7 @@ class TrackingDecoder:
                 options['binarizer'] = binarizer
             found = []
             for result in self.zxing.read_barcodes(np.ascontiguousarray(image), **options):
-                if not result.text:
+                if not result.valid or not result.text:
                     continue
                 p = result.position
                 found.append((result.text, np.float32([[q.x, q.y] for q in
@@ -291,8 +298,8 @@ class TrackingDecoder:
             return [(text, points.reshape(-1, 2)[:4].astype(np.float32))]
         return []
 
-    def _read_wechat(self, image):
-        self.owner.detector.setScaleFactor(1.0)
+    def _read_wechat(self, image, scale=1.0):
+        self.owner.detector.setScaleFactor(scale)
         texts, corners = self.owner.detector.detectAndDecode(image)
         return [(text, np.asarray(corners[i], np.float32).reshape(4, 2))
                 for i, text in enumerate(texts) if text and i < len(corners)]
@@ -322,6 +329,8 @@ class TrackingDecoder:
             found = self._read(image, binarizer)
             if found:
                 return self._map(found, offset, scale, border)
+        if pre is not None:
+            return self._map(self._read_wechat(image), offset, scale, border)
         return []
 
     # Lighting recipes operate on the upscaled, bordered image.
@@ -353,8 +362,10 @@ class TrackingDecoder:
         total, used = reference.copy(), 1
         for old in list(track.crops)[:-1]:
             image = cv2.resize(old, (width, height), interpolation=cv2.INTER_CUBIC).astype(np.float32)
-            (dx, dy), response = cv2.phaseCorrelate(reference, image, window)
-            if response < .1 or math.hypot(dx, dy) > .25 * min(width, height):
+            # OpenCV can apply the Hanning window in place to floating inputs.
+            # Preserve unwindowed pixels for averaging and subsequent alignment.
+            (dx, dy), response = cv2.phaseCorrelate(reference.copy(), image.copy(), window)
+            if not all(math.isfinite(v) for v in (dx, dy, response)) or response < .1 or math.hypot(dx, dy) > .25 * min(width, height):
                 continue
             total += cv2.warpAffine(image, np.float32([[1, 0, -dx], [0, 1, -dy]]), (width, height),
                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
@@ -376,8 +387,10 @@ class TrackingDecoder:
             if fused is None:
                 return []
             image, s = fused
-            return (self._decode_roi(image, offset, s, prescaled=True, binarizers=self.binarizers)
-                    or self._decode_roi(image, offset, s, self._clahe, prescaled=True))
+            found = self._decode_roi(image, offset, s, prescaled=True, binarizers=self.binarizers)
+            if not found and self.owner.lighting:
+                found = self._decode_roi(image, offset, s, self._clahe, prescaled=True)
+            return found
         if name == 'rectify':
             image, s, border = self._prepare(roi, max(scale, 2.0))
             ok, points = self.owner.qr.detect(image)
@@ -404,34 +417,40 @@ class TrackingDecoder:
         edge = float(np.mean(np.linalg.norm(track.corners - np.roll(track.corners, -1, axis=0), axis=1)))
         self._ppm = max(.5, edge / self.modules)
         scale = min(float(np.clip(self.target_ppm / self._ppm, 1.0, 4.0)), 1000 / max(roi.shape))
-        recent = stamp - track.last_decode < 1.0
+        track.last_service = self.sequence
+        heavy = [name for name in HEAVY if self.owner.lighting or name not in LIGHTING_RECIPES]
         names = ['crop']
-        if not recent:
-            names += ['crop-up'] + [HEAVY[(track.rot + i) % len(HEAVY)] for i in range(self.heavy_per_visit)]
-        for index, name in enumerate(names):
+        if track.last_method in ('crop-up', *heavy):
+            names.append(track.last_method)
+        names += ['crop-up'] + [heavy[(track.rot + i) % len(heavy)] for i in range(self.heavy_per_visit)]
+        for index, name in enumerate(dict.fromkeys(names)):
             if index and time.perf_counter() >= deadline:
                 break
             found = self._run(name, track, roi, (x1, y1), scale)
             if found:
                 for text, points in found:
                     self._record(text, points, name, gray, frame_id, stamp, captured_at)
-                track.fails, track.last_decode = 0, stamp
+                track.fails, track.last_decode, track.last_method = 0, stamp, name
                 return True
         track.fails += 1
-        if not recent:
-            track.rot += self.heavy_per_visit
+        track.rot += self.heavy_per_visit
         return False
 
-    def _discover(self, gray, frame_id, stamp, captured_at, deadline, full_only=False):
-        """Fallback when ROI decoding found nothing: native full frame, alternating with rolling tiles."""
+    def _discover(self, frame, frame_id, stamp, captured_at, deadline):
+        """Alternate global acquisition and native tiles; neither path can starve the other."""
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.idle += 1
         tiles = self.owner.tiles_per_frame
-        if self.idle % 2 or not tiles or full_only:
+        if self.idle % 2 or not tiles:
             began = time.perf_counter()
             found = self._read(gray, downscale=True)
             self.full_ms = .7 * self.full_ms + .3 * (time.perf_counter() - began) * 1000
+            method = 'full'
+            if not found and (not self.owner.use_zxing or time.perf_counter() < deadline):
+                method = 'full/wechat'
+                found = self._read_wechat(gray, min(1., self.owner.tile_size / max(gray.shape)))
             for text, points in found:
-                self._record(text, points, 'full', gray, frame_id, stamp, captured_at)
+                self._record(text, points, method, gray, frame_id, stamp, captured_at)
             return bool(found)
         regions = self.tiles(gray.shape, self.owner.tile_size)
         decoded = False
@@ -442,13 +461,15 @@ class TrackingDecoder:
             self.owner.cursor += 1
             self.attempted += 1
             x1, y1, x2, y2 = regions[index]
-            tile = np.ascontiguousarray(gray[y1:y2, x1:x2])
-            method, found = 'tile', self._read(tile)
-            if not found and time.perf_counter() < deadline:
-                method, found = 'tile/wechat', self._read_wechat(tile)
-            if not found and self.owner.lighting and time.perf_counter() < deadline:
-                mode = self.owner.LIGHTING_MODES[sweep % len(self.owner.LIGHTING_MODES)]
-                method, found = 'tile/' + mode, self._read(self.owner.correct_lighting(tile, mode))
+            tile = np.ascontiguousarray(frame[y1:y2, x1:x2])
+            modes = (*self.owner.LIGHTING_MODES, 'raw') if self.owner.lighting else ('raw',)
+            mode = modes[sweep % len(modes)]
+            view = tile if mode == 'raw' else self.owner.correct_lighting(tile, mode)
+            method, found = 'tile/' + mode, self._read(view)
+            # One tile is a complete decoder pair, even if the first native call
+            # overruns. Otherwise expensive raw calls can starve recovery forever.
+            if not found:
+                method, found = method + '/wechat', self._read_wechat(view)
             for text, points in found:
                 self._record(text, points + (x1, y1), method, gray, frame_id, stamp, captured_at)
             decoded |= bool(found)
@@ -457,6 +478,7 @@ class TrackingDecoder:
     # -------------------------------------------------------------------- main
     def decode(self, frame, frame_id=None, timestamp=None, captured_at=None):
         if frame is None or not frame.size:
+            self.observations = []
             return []
         self.sequence += 1
         frame_id = self.sequence if frame_id is None else frame_id
@@ -474,9 +496,15 @@ class TrackingDecoder:
             self._associate(corners, stamp, True, score)
 
         decoded = False
+        # Reserve a turn before crop work on periodic frames. A busy scene or a
+        # native call overrunning the budget cannot postpone discovery forever.
+        discovery_due = self.sequence % self.discovery_every == 0
+        if discovery_due:
+            decoded |= self._discover(frame, frame_id, stamp, captured_at, started + self.budget * .4)
         live = [t for t in self.tracks if t.seen == stamp]
-        # Fresh, promising candidates first; ones that keep failing or are already decoded last.
-        live.sort(key=lambda t: (t.fails >= 6, stamp - t.last_decode < 1.0, -t.score))
+        # Oldest serviced first, then promising candidates. Large easy codes must
+        # not monopolize the budget while a smaller code waits for recovery.
+        live.sort(key=lambda t: (t.last_service, -t.score))
         service_deadline = started + self.budget * .8
         serviced = 0
         for track in live:
@@ -490,8 +518,8 @@ class TrackingDecoder:
         # Full-frame ZXing binarizes differently from a crop, so it catches frames the ROI path
         # misses. Run it every frame while it is cheap; throttle it on slow hardware.
         cheap = self.full_ms < self.budget * 500 and self.owner.use_zxing
-        if not decoded and (not self.tracks or cheap or self.sequence % self.discovery_every == 0):
-            decoded |= self._discover(gray, frame_id, stamp, captured_at, deadline, cheap and bool(self.tracks))
+        if not discovery_due and not decoded and (not self.tracks or cheap):
+            decoded |= self._discover(frame, frame_id, stamp, captured_at, deadline)
 
         for track in live:   # localization is useful diagnostic evidence even when decoding failed
             if not any(o['track_id'] == track.id for o in self.observations):

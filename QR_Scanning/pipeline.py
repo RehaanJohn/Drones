@@ -72,7 +72,7 @@ def _enable_gray_capture(cap):
     return False
 
 
-def _linux_capture(options, channel, commands):
+def _linux_capture(options, channel, commands, slot_locks, slot_versions):
     # Imported only inside the spawned child; the parent can terminate any stalled native call.
     if __package__:
         from . import linux_camera
@@ -152,8 +152,10 @@ def _linux_capture(options, channel, commands):
             captured = datetime.datetime.now().astimezone()
             if shm is not None and frame.nbytes <= slot_bytes:
                 slot = count % slots
-                np.ndarray(frame.shape, np.uint8, buffer=shm.buf, offset=slot * slot_bytes)[...] = frame
-                replace_latest(channel, ('shm', (slot, frame.shape), end, captured, full, dynamic))
+                with slot_locks[slot]:
+                    np.ndarray(frame.shape, np.uint8, buffer=shm.buf, offset=slot * slot_bytes)[...] = frame
+                    slot_versions[slot] = count
+                replace_latest(channel, ('shm', (slot, frame.shape, count), end, captured, full, dynamic))
             else:
                 replace_latest(channel, ('frame', frame, end, captured, full, dynamic))
     except Exception as exc:
@@ -189,6 +191,7 @@ class ProcessCapture:
         self.restart_count = 0
         self.captured_monotonic = 0
         self.context = mp.get_context('spawn')
+        self.slot_locks = self.slot_versions = None
         self.candidates = []
 
     def _start(self):
@@ -204,7 +207,11 @@ class ProcessCapture:
             options['shm_name'] = None
         self.channel = self.context.Queue(maxsize=2)
         self.commands = self.context.Queue(maxsize=1)
-        self.process = self.context.Process(target=_linux_capture, args=(options, self.channel, self.commands), daemon=True)
+        self.slot_locks = [self.context.Lock() for _ in range(SHM_SLOTS)]
+        self.slot_versions = self.context.Array('Q', SHM_SLOTS, lock=False)
+        self.process = self.context.Process(target=_linux_capture,
+                                            args=(options, self.channel, self.commands,
+                                                  self.slot_locks, self.slot_versions), daemon=True)
         self.process.start()
 
     def _close(self):
@@ -234,6 +241,20 @@ class ProcessCapture:
             self.shm = None
         self.process = self.channel = None
         self.commands = None
+        self.slot_locks = self.slot_versions = None
+
+    def _copy_shared_frame(self, payload):
+        slot, shape, generation = payload
+        lock = self.slot_locks[slot]
+        if not lock.acquire(timeout=.5):
+            raise RuntimeError('Camera shared-memory slot is stalled')
+        try:
+            if self.slot_versions[slot] != generation:
+                return None  # The message refers to a slot that has since been reused.
+            return np.ndarray(shape, np.uint8, buffer=self.shm.buf,
+                              offset=slot * self.slot_bytes).copy()
+        finally:
+            lock.release()
 
     def meter(self, observation):
         if self.commands is not None:
@@ -260,10 +281,9 @@ class ProcessCapture:
                     raise RuntimeError(message[1])
                 kind, payload, stamp, captured, full, dynamic = message
                 if kind == 'shm':
-                    slot, shape = payload
-                    view = np.ndarray(shape, np.uint8, buffer=self.shm.buf, offset=slot * self.slot_bytes)
-                    frame = view.copy()
-                    del view
+                    frame = self._copy_shared_frame(payload)
+                    if frame is None:
+                        continue
                 else:
                     frame = payload
                 if full is not None:

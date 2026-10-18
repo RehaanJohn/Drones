@@ -174,7 +174,7 @@ class ScannerTests(unittest.TestCase):
     def test_tiles_advance_even_when_full_frame_decodes(self):
         detector = Mock()
         detector.detectAndDecode.return_value = (['easy'], [])
-        engine = scanner.QRScanner(detector, use_zxing=False, tiles_per_frame=1)
+        engine = scanner.LegacyQRScanner(detector, use_zxing=False, tiles_per_frame=1)
         frame = np.zeros((720, 1280), np.uint8)
         for _ in range(8):
             self.assertEqual(engine.decode(frame), ['easy'])
@@ -201,7 +201,7 @@ class ScannerTests(unittest.TestCase):
 
     def test_missing_zxing_uses_wechat(self):
         detector = Mock()
-        detector.detectAndDecode.return_value = (['opencv'], [])
+        detector.detectAndDecode.return_value = (['opencv'], [np.float32([[10,10],[60,10],[60,60],[10,60]])])
         with patch.object(scanner, 'zxingcpp', None):
             engine = scanner.QRScanner(detector, tiles_per_frame=0)
             self.assertFalse(engine.use_zxing)

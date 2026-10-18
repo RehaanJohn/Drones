@@ -92,10 +92,11 @@ mission. It is useful offline but does not replace the Ubuntu SITL gate:
 python3 tools/offline_smoke.py
 ```
 
-The package installs a copy of the existing `../QR_Scanning/scanner.py` as a decoding
-library. Its original terminal program is unchanged. By default the adapter uses
-OpenCV QRCodeDetector and reuses the existing scanner's cropped fallbacks; it uses
-WeChat when compatible OpenCV-contrib and all four weights are present. Mission
+The package installs `../QR_Scanning/scanner.py` and `tracking.py` as a decoding
+library, sharing native crop discovery and lighting recovery with the terminal
+scanner. It uses WeChat when compatible OpenCV-contrib and all four weights are
+present, and an OpenCV fallback otherwise. Independent localization also remains
+available when WeChat returns no decoded corners. Mission
 startup never downloads models. Provision weights once if using WeChat:
 
 ```bash

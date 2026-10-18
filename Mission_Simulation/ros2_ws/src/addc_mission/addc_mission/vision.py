@@ -1,5 +1,6 @@
 """Image-only prototype discovery and adapter for the existing QR scanner."""
 import importlib.util
+import sys
 from pathlib import Path
 import cv2
 import numpy as np
@@ -35,11 +36,16 @@ def discover(frame, mode='color', min_area=80):
 class QRBackend:
     def __init__(self, scanner_path='', model_dir=''):
         self.scanner = None
+        self.engine = None
         self.detector = cv2.QRCodeDetector()
         self.name = 'OpenCV QRCodeDetector'
         if scanner_path:
-            spec = importlib.util.spec_from_file_location('addc_existing_qr_scanner', scanner_path)
+            # Load as a package so the installed companion tracking.py is available
+            # without modifying sys.path or colliding with unrelated scanner modules.
+            spec = importlib.util.spec_from_file_location('addc_existing_qr_scanner', scanner_path,
+                                                         submodule_search_locations=[str(Path(scanner_path).parent)])
             module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             self.scanner = module
             if model_dir:
@@ -49,13 +55,33 @@ class QRBackend:
                     all((module.MODEL_DIR/name).is_file() for name in module.MODEL_FILES)):
                 self.detector = module.create_detector()
                 self.name = 'Existing scanner WeChat + cropped fallbacks'
+            if (Path(scanner_path).parent / 'tracking.py').is_file():
+                detector = self.detector if self.name.startswith('Existing') else _OpenCVFallback()
+                self.engine = module.QRScanner(detector=detector)
+                self.name = 'Shared QRScanner tracking and lighting recovery'
 
     def detect(self, frame):
-        if self.name.startswith('Existing'):
+        if self.engine is not None:
+            observations = [(np.asarray(o['corners']).mean(axis=0), o['corners'], o['payload'])
+                            for o in self.engine.observe(frame) if o['corners'] is not None]
+            # Texture-only candidates are useful locally but are not reliable
+            # mission centering targets. Keep independent geometric detections below.
+            observations = [o for o in observations if o[2]]
+            if observations:
+                return observations
+            texts, points = (), None
+        elif self.name.startswith('Existing'):
             texts, points = self.detector.detectAndDecode(frame)
         else:
             _, texts, points, _ = self.detector.detectAndDecodeMulti(frame)
         observations = []
+        if points is None or not len(points):
+            # WeChat exposes decoded corners only. Localize separately on failure.
+            independent = cv2.QRCodeDetector()
+            ok, points = independent.detectMulti(frame)
+            if not ok:
+                points = None
+            texts = ()
         if points is not None:
             for i, region in enumerate(points):
                 payload = texts[i] if i < len(texts) else ''
@@ -71,3 +97,16 @@ class QRBackend:
                 u, v, corners = sheet
                 observations.append(((u, v), corners, ''))
         return observations
+
+
+class _OpenCVFallback:
+    """Offline substitute when WeChat weights were not provisioned before flight."""
+    def __init__(self):
+        self.detector = cv2.QRCodeDetector()
+
+    def setScaleFactor(self, scale):
+        pass
+
+    def detectAndDecode(self, frame):
+        _, texts, points, _ = self.detector.detectAndDecodeMulti(frame)
+        return texts, points if points is not None else ()

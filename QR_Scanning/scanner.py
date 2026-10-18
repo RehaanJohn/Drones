@@ -20,7 +20,8 @@ def _component(name):
     return importlib.import_module('.' + name, __package__) if __package__ else importlib.import_module(name)
 
 
-# Keep the standalone decoder helpers importable by the ROS adapter, which copies only scanner.py.
+# Keep decoder helpers importable by the ROS adapter; camera/network dependencies
+# are unnecessary for mission inference (scanner.py plus tracking.py).
 # Camera/network dependencies are loaded only when their functionality is used.
 def LinkResolver(*args, **kwargs):
     return _component('link_resolver').LinkResolver(*args, **kwargs)
@@ -660,7 +661,7 @@ def make_parser():
     parser.add_argument("--confirm-frames", type=int, default=1, help="Distinct frames that must agree before a payload is reported. QR error correction already validates a decode, so 1 maximizes range; use 2 to demand repetition")
     parser.add_argument("--max-candidates", type=int, default=4, help="Localizer candidates examined per frame")
     parser.add_argument("--target-ppm", type=float, default=5.0, help="Pixels per module that small candidates are upscaled toward before decoding")
-    parser.add_argument("--discovery-every", type=int, default=3, help="While candidates exist but nothing decodes, run full-frame/tile discovery every N frames")
+    parser.add_argument("--discovery-every", type=int, default=3, help="Reserve full-frame/tile discovery every N frames, including while other codes decode")
     parser.add_argument("--try-invert", action="store_true", help="Also look for inverted (light-on-dark) QR codes; doubles ZXing work")
     parser.add_argument("--gray-capture", action="store_true", help="Linux: decode MJPEG straight to grayscale and skip color conversion (not with --diagnostics)")
     parser.add_argument("--log-observations", action="store_true", help="Include provisional geometry/quality records in JSONL")

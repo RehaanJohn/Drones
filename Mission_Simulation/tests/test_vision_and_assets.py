@@ -30,6 +30,15 @@ class VisionTests(unittest.TestCase):
         results = backend.detect(frame)
         self.assertIn('07', [r[2] for r in results])
 
+    def test_shared_scanner_handles_small_qr_without_wechat_weights(self):
+        scanner = ROOT.parent/'QR_Scanning'/'scanner.py'
+        backend = QRBackend(str(scanner), '/nonexistent-addc-test-weights')
+        self.assertIsNotNone(backend.engine)
+        code = cv2.resize(cv2.QRCodeEncoder_create().encode('07'),(60,60),interpolation=cv2.INTER_NEAREST)
+        frame = np.full((1080,1920,3),180,np.uint8)
+        frame[600:660,1200:1260] = cv2.cvtColor(code,cv2.COLOR_GRAY2BGR)
+        self.assertIn('07',[o[2] for o in backend.detect(frame)])
+
     def test_world_truth_is_not_a_ros_parameter(self):
         config = (ROOT/'ros2_ws/src/addc_mission/config/mission.yaml').read_text()
         self.assertNotIn('payload:', config)

@@ -18,7 +18,7 @@ import scanner
 
 def observation(frame_id, stamp, payload='target', confirmed=True):
     return dict(frame_id=frame_id, capture_monotonic=stamp, track_id=1,
-                payload=payload, confirmed=confirmed,
+                payload=payload, confirmed=confirmed, method='crop',
                 corners=[[20,20],[78,20],[78,78],[20,78]],
                 quality=dict(module_px_estimate=2, contrast=180, sharpness=80),
                 captured_at=None)

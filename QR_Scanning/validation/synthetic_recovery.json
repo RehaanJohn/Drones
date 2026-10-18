@@ -1,0 +1,999 @@
+{
+  "environment": {
+    "python": "3.12.14",
+    "opencv": "4.14.0",
+    "zxing": "3.1.1",
+    "ncnn": "1.0.20260526"
+  },
+  "note": "Synthetic stills; eight decode passes maximum per image, one NCNN default pass. Not a field distance or lighting guarantee. NCNN checks target center, not decoding or full bounding-box accuracy.",
+  "cases": [
+    {
+      "name": "41px_clean",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "clean",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 15.9
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.5
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 43.4
+      }
+    },
+    {
+      "name": "41px_shadow",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "shadow",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 355.3
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 13.0
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.5
+      }
+    },
+    {
+      "name": "41px_low_contrast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "low_contrast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 8.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.4
+      }
+    },
+    {
+      "name": "41px_color_cast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "color_cast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 8.4
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.7
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.0
+      }
+    },
+    {
+      "name": "41px_defocus",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "defocus",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 334.8
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 739.1
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.8
+      }
+    },
+    {
+      "name": "41px_motion",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "motion",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 319.0
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 582.5
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.3
+      }
+    },
+    {
+      "name": "41px_glare",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "glare",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 339.2
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 743.3
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.6
+      }
+    },
+    {
+      "name": "41px_perspective",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 41,
+      "modules": 21,
+      "pixels_per_module": 1.41,
+      "condition": "perspective",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 374.6
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 715.9
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 33.5
+      }
+    },
+    {
+      "name": "60px_clean",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "clean",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 8.3
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 33.2
+      }
+    },
+    {
+      "name": "60px_shadow",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "shadow",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 308.1
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 9.3
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.4
+      }
+    },
+    {
+      "name": "60px_low_contrast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "low_contrast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 8.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.6
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.1
+      }
+    },
+    {
+      "name": "60px_color_cast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "color_cast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 8.9
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.7
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.8
+      }
+    },
+    {
+      "name": "60px_defocus",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "defocus",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 2,
+        "elapsed_ms": 82.5
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.0
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.7
+      }
+    },
+    {
+      "name": "60px_motion",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "motion",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 290.8
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 538.5
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.5
+      }
+    },
+    {
+      "name": "60px_glare",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "glare",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 308.9
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 622.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.6
+      }
+    },
+    {
+      "name": "60px_perspective",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 60,
+      "modules": 21,
+      "pixels_per_module": 2.07,
+      "condition": "perspective",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 309.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.0
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.6
+      }
+    },
+    {
+      "name": "90px_clean",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "clean",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.8
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.0
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.7
+      }
+    },
+    {
+      "name": "90px_shadow",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "shadow",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 9.4
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 9.2
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.6
+      }
+    },
+    {
+      "name": "90px_low_contrast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "low_contrast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 2,
+        "elapsed_ms": 86.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.8
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.5
+      }
+    },
+    {
+      "name": "90px_color_cast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "color_cast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.8
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.9
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.5
+      }
+    },
+    {
+      "name": "90px_defocus",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "defocus",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.8
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.9
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.6
+      }
+    },
+    {
+      "name": "90px_motion",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "motion",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.9
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 6.8
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.6
+      }
+    },
+    {
+      "name": "90px_glare",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "glare",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 180.6
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 661.7
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.5
+      }
+    },
+    {
+      "name": "90px_perspective",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 90,
+      "modules": 21,
+      "pixels_per_module": 3.1,
+      "condition": "perspective",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.3
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.5
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.6
+      }
+    },
+    {
+      "name": "120px_clean",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "clean",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 7.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.2
+      }
+    },
+    {
+      "name": "120px_shadow",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "shadow",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 10.6
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 9.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.2
+      }
+    },
+    {
+      "name": "120px_low_contrast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "low_contrast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 9.2
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 15.4
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.4
+      }
+    },
+    {
+      "name": "120px_color_cast",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "color_cast",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.8
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.2
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.6
+      }
+    },
+    {
+      "name": "120px_defocus",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "defocus",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.6
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.1
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.3
+      }
+    },
+    {
+      "name": "120px_motion",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "motion",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.7
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.6
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 35.2
+      }
+    },
+    {
+      "name": "120px_glare",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "glare",
+      "before": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 216.2
+      },
+      "after": {
+        "payloads": [],
+        "correct": false,
+        "passes": 8,
+        "elapsed_ms": 769.6
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.8
+      }
+    },
+    {
+      "name": "120px_perspective",
+      "expected": [
+        "DRONE-01"
+      ],
+      "outer_qr_pixels": 120,
+      "modules": 21,
+      "pixels_per_module": 4.14,
+      "condition": "perspective",
+      "before": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 5.0
+      },
+      "after": {
+        "payloads": [
+          "DRONE-01"
+        ],
+        "correct": true,
+        "passes": 1,
+        "elapsed_ms": 4.7
+      },
+      "ncnn": {
+        "boxes": 1,
+        "target_center_detected": true,
+        "inference_ms": 34.6
+      }
+    },
+    {
+      "name": "no_qr_clutter",
+      "expected": [],
+      "condition": "negative_control",
+      "before": {
+        "payloads": [],
+        "correct": true,
+        "passes": 8,
+        "elapsed_ms": 288.6
+      },
+      "after": {
+        "payloads": [],
+        "correct": true,
+        "passes": 8,
+        "elapsed_ms": 352.7
+      },
+      "ncnn": {
+        "boxes": 0,
+        "target_center_detected": null,
+        "inference_ms": 29.1
+      }
+    }
+  ],
+  "settings": {
+    "decode_passes_max": 8,
+    "decode_budget_ms": 150,
+    "ncnn_confidence": 0.6,
+    "ncnn_tile_sizes": [
+      384,
+      192
+    ],
+    "ncnn_tiles_per_frame": 4,
+    "ncnn_lighting": true,
+    "ncnn_threads": 2
+  }
+}

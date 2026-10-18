@@ -10,8 +10,9 @@ setup(
         ('share/addc_mission', ['package.xml']),
         ('share/addc_mission/launch', glob('launch/*.launch.py')),
         ('share/addc_mission/config', glob('config/*.yaml')),
-        ('share/addc_mission/qr', [relpath(Path(__file__).resolve().parents[4]/'QR_Scanning'/'scanner.py',
-                                             Path(__file__).resolve().parent)]),
+        ('share/addc_mission/qr', [relpath(Path(__file__).resolve().parents[4]/'QR_Scanning'/name,
+                                             Path(__file__).resolve().parent)
+                                 for name in ('scanner.py', 'tracking.py')]),
     ],
     install_requires=['setuptools'], zip_safe=True,
     maintainer='ADDC team', maintainer_email='team@example.com',

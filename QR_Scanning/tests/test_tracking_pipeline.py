@@ -121,7 +121,7 @@ class TrackingTests(unittest.TestCase):
         self.assertTrue(any(o['confirmed'] for o in result))
 
     def test_duplicate_frame_cannot_confirm_but_second_capture_does(self):
-        engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)
+        engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300, confirm_frames=2)
         frame = qr_frame()
         first = engine.observe(frame, 1, 10)
         self.assertTrue(any(o['payload'] for o in first))
@@ -141,7 +141,7 @@ class TrackingTests(unittest.TestCase):
         np.testing.assert_array_equal(second, saved)
 
     def test_expired_track_does_not_confirm_new_encounter(self):
-        engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)
+        engine = scanner.QRScanner(tiles_per_frame=0, budget_ms=300, confirm_frames=2)
         engine.observe(qr_frame(), 1, 10)
         observations = engine.observe(qr_frame(), 2, 13)
         self.assertFalse(any(o['confirmed'] for o in observations))
@@ -161,9 +161,9 @@ class TrackingTests(unittest.TestCase):
         points = np.float32([[[10, 10], [40, 10], [40, 40], [10, 40]],
                             [[70, 70], [100, 70], [100, 100], [70, 100]]])
         engine.qr = Mock()
-        engine.qr.detectMulti.return_value = (True, points)
         engine.qr.detectAndDecode.return_value = ('', None, None)
-        result = engine.observe(np.zeros((128, 128, 3), np.uint8), 1, 10)
+        with patch.object(engine.tracker.finder, 'find', return_value=[(p, 100) for p in points]):
+            result = engine.observe(np.zeros((128, 128, 3), np.uint8), 1, 10)
         self.assertEqual(len(engine.tracker.tracks), 2)
         self.assertEqual(len({o['track_id'] for o in result}), 2)
 
@@ -210,7 +210,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_decoder_worker_confirms_distinct_frames_and_stops(self):
         history = pipeline.FrameHistory()
-        detector = scanner.QRScanner(tiles_per_frame=0, budget_ms=300)
+        detector = scanner.QRScanner(tiles_per_frame=0, budget_ms=300, confirm_frames=2)
         stamp = datetime.datetime.now().astimezone()
         with pipeline.DecoderWorker(detector, interval=0) as worker:
             history.add(qr_frame(), stamp)

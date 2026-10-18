@@ -206,19 +206,24 @@ settling latency. Validate settling using recordings and control-change timestam
 
 ## Decoder and output
 
-Tracked regions get the first 75% of the scheduling window. Discovery receives
-25% credit per scan, with debt carried forward after expensive calls. Native
-decoder calls cannot be interrupted: `--budget-ms 150` is a scheduling budget,
-not a hard deadline. Candidates are processed oldest-attempt-first.
+Every `--discovery-every 3` processed frames reserves discovery before crop work,
+even while other codes decode. Global and native tiled discovery alternate so
+neither can starve. Additional discovery runs after unsuccessful crop work when
+affordable. Native decoder calls cannot be interrupted: `--budget-ms 150` is a
+scheduling budget, not a hard deadline. Candidates are serviced oldest-first.
 
-Recovery tries untouched crops, valid perspective rectification, then at most two
-quality-selected variants: shadow normalization, CLAHE, channel extraction,
-adaptive thresholding or mild sharpening. Windows scale with the configured QR
-module count. A tile-level lighting fallback also helps when localization fails.
+Recovery tries untouched crops, the last successful recipe, upscaling, and a
+rotating ladder of WeChat, aligned frame fusion, CLAHE, shadow normalization,
+sharpening, perspective correction and adaptive thresholding. Successful recovery
+is retried on the next capture, allowing prompt multi-frame confirmation.
+Lighting-corrected crops and tiles retain WeChat fallback. Native tile sweeps
+also rotate through raw and lighting variants, including color-channel extraction.
+`--no-lighting` disables corrections in both crop and fusion paths as well as tiles.
 
 The recent-frame cache retains at most 0.5 seconds and 64 MiB. Best-history
 selection uses tracked regions when available, followed by re-localization.
-Active frames, worker queues and native libraries use additional memory; this
+Linux shared-memory slots use locks and generation checks: overwritten messages
+are discarded, and a frame copy cannot overlap a writer. Active frames, worker queues and native libraries use additional memory; this
 is not a total-process memory limit. Separate capture, decode and output workers
 have bounded queues and report dropped results.
 
@@ -264,6 +269,25 @@ returns structured observations; distinct frame IDs are necessary for confirmati
 Use `reset()` between independent sessions. Existing `create_detector`,
 `crop_qr_region`, and `fallback_decode` interfaces remain for mission integration.
 `LegacyQRScanner` retains the preceding scanner for comparison.
+
+## Separate NCNN presence detector
+
+[`ncnn_detector.py`](ncnn_detector.py) runs a QR-specific NCNN model without decoding,
+with an OpenCV preview, small native crops and lighting variants. See
+[`NCNN_DETECTOR.md`](NCNN_DETECTOR.md) for installation, camera/image/video commands,
+the 280 mm A3 example, and the distinction between detection and readable range.
+
+For the decoder's outdoor tests, keep lighting recovery enabled and start with:
+
+```bash
+python QR_Scanning/scanner.py --width 1920 --height 1080 --budget-ms 300 --diagnostics --no-resolve-links
+```
+
+The larger scheduling budget gives difficult crops more recovery opportunities,
+at the cost of processing fewer frames. Compare recorded flight frames before
+choosing it over the 150 ms default. For longer range, native optical detail and
+camera focus/exposure matter more than arbitrary digital enlargement. No maximum
+distance is claimed without a measured camera, lens and printed target.
 
 ## Optical qualification
 

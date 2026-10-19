@@ -14,6 +14,9 @@ import threading
 import time
 import urllib.request
 
+if __name__ == '__main__':
+    print('[startup] Importing OpenCV and NumPy...', file=sys.stderr, flush=True)
+
 import cv2
 import numpy as np
 
@@ -88,15 +91,18 @@ class NCNNQRDetector:
     come from NCNN inference. No QR decoding API is called by this class.
     """
     def __init__(self, model_dir=MODEL_DIR, confidence=.6, threads=2, tile_sizes=(384, 192),
-                 tiles_per_frame=4, lighting=True, max_candidates=2, exhaustive=False):
+                 tiles_per_frame=4, lighting=True, max_candidates=2, exhaustive=False, progress=None):
+        report = progress or (lambda message: None)
         if not math.isfinite(confidence) or not 0 < confidence < 1:
             raise ValueError('Confidence must be between zero and one')
         if threads < 1 or tiles_per_frame < 0 or max_candidates < 0 or not tile_sizes or min(tile_sizes) < 64:
             raise ValueError('Invalid thread count, tile sizes, tile count or candidate count')
         try:
+            report('Importing NCNN runtime...')
             import ncnn
         except ImportError as exc:
             raise RuntimeError('Install NCNN with: python -m pip install --no-deps ncnn==1.0.20260526') from exc
+        report('Verifying model files...')
         param, weights = model_files(model_dir)
         self.ncnn = ncnn
         self.net = ncnn.Net()
@@ -109,6 +115,7 @@ class NCNNQRDetector:
             if line.startswith('DetectionOutput'):
                 tokens = line.split()
                 lines[i] = ' '.join(f'4={confidence}' if t.startswith('4=') else t for t in tokens)
+        report('Loading NCNN model...')
         if self.net.load_param_mem('\n'.join(lines) + '\n') != 0 or self.net.load_model(str(weights)) != 0:
             raise RuntimeError('NCNN could not load the QR detector')
         self.confidence = confidence
@@ -120,6 +127,7 @@ class NCNNQRDetector:
         self.cursor = self.sequence = 0
         self.shape = None
         self.last_stats = {}
+        report('NCNN model ready')
 
     def infer(self, gray, offset=(0, 0), method='raw'):
         """Letterbox to 384 square; undo padding and scale before adding crop offset."""
@@ -221,8 +229,10 @@ class NCNNQRDetector:
 
 class DetectionWorker:
     """Latest frame wins; inference stays off the preview/capture thread."""
-    def __init__(self, detector):
+    def __init__(self, detector=None, factory=None):
         self.detector = detector
+        self.factory = factory
+        self.status = 'Loading NCNN model' if detector is None else 'Waiting for first inference'
         self.input, self.results = queue.Queue(1), queue.Queue(1)
         self.stop = threading.Event()
         self.error = None
@@ -235,15 +245,27 @@ class DetectionWorker:
     def submit(self, frame, stamp):
         replace_latest(self.input, (frame, stamp))
 
+    def _progress(self, message):
+        self.status = message
+        print('[NCNN] ' + message, file=sys.stderr, flush=True)
+
     def _run(self):
         try:
+            if self.detector is None:
+                self.detector = self.factory(self._progress)
+            first = True
             while not self.stop.is_set():
                 try:
                     frame, stamp = self.input.get(timeout=.1)
                 except queue.Empty:
                     continue
+                if first:
+                    self._progress('Running first inference...')
                 boxes = self.detector.detect(frame)
                 replace_latest(self.results, (frame, stamp, boxes, dict(self.detector.last_stats)))
+                if first:
+                    self._progress('Inference ready')
+                    first = False
         except Exception as exc:
             self.error = exc
 
@@ -264,8 +286,29 @@ def draw(frame, boxes, stats):
     label = (f"QR-like regions: {len(boxes)} (not decoded) | {stats.get('inference_ms', 0):.0f} ms | "
              f"tiles {stats.get('tiles_visited', 0)}/{stats.get('tiles_in_sweep', 0)} | "
              f"age {stats.get('result_age_ms', 0):.0f} ms")
+    label = stats.get('status', label)
     cv2.rectangle(image, (0, 0), (image.shape[1], 34), (20, 20, 20), -1)
     cv2.putText(image, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
+    return image
+
+
+def live_view(frame, result, now, status):
+    """Always show the current capture; old geometry stays in a labelled inset."""
+    image = draw(frame, [], {'status': 'LIVE CAMERA | ' + status + ' | Q / Esc to quit'})
+    if result is None:
+        return image
+    analyzed, stamp, boxes, stats = result
+    age_ms = max(0, (now - stamp) * 1000)
+    thumbnail = draw(analyzed, boxes, dict(stats, result_age_ms=age_ms))
+    height, width = image.shape[:2]
+    scale = min(.42 * width / thumbnail.shape[1], .42 * height / thumbnail.shape[0])
+    tw, th = max(1, round(thumbnail.shape[1] * scale)), max(1, round(thumbnail.shape[0] * scale))
+    thumbnail = cv2.resize(thumbnail, (tw, th), interpolation=cv2.INTER_AREA)
+    x, y = width - tw, height - th
+    image[y:, x:] = thumbnail
+    cv2.rectangle(image, (x, y), (width - 1, height - 1), (0, 220, 255), 2)
+    cv2.putText(image, f'Last analysis: {len(boxes)} regions, {age_ms:.0f} ms ago',
+                (x, max(48, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 220, 255), 1)
     return image
 
 
@@ -279,6 +322,7 @@ def make_parser():
     sources.add_argument('--video', type=Path, help='Analyze every frame of a recording')
     parser.add_argument('--model-dir', type=Path, default=MODEL_DIR)
     parser.add_argument('--download-models', action='store_true', help='Provision/check pinned weights and exit')
+    parser.add_argument('--self-test', action='store_true', help='Test NCNN on a blank image, without camera or window')
     parser.add_argument('--confidence', type=float, default=.6,
                         help='Model score threshold; lower toward 0.25 for more candidates and more false positives')
     parser.add_argument('--threads', type=int, default=2)
@@ -332,12 +376,17 @@ def main(argv=None):
             model_files(args.model_dir, download=True)
             print(f'NCNN models verified: {args.model_dir.resolve()}')
             return 0
-        detector = NCNNQRDetector(args.model_dir, args.confidence, args.threads, args.tile_sizes,
-                                  args.tiles_per_frame, not args.no_lighting, args.max_candidates, args.exhaustive)
+        def report(message):
+            print('[startup] ' + message, file=sys.stderr, flush=True)
 
-        def show(frame, boxes, stats, wait=1):
+        def load_detector(progress=report):
+            return NCNNQRDetector(args.model_dir, args.confidence, args.threads, args.tile_sizes,
+                                   args.tiles_per_frame, not args.no_lighting, args.max_candidates,
+                                   args.exhaustive, progress=progress)
+
+        def show(frame, boxes, stats, wait=1, prepared=False):
             nonlocal opened
-            image = draw(frame, boxes, stats)
+            image = frame if prepared else draw(frame, boxes, stats)
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 if not cv2.imwrite(str(args.output), image):
@@ -345,6 +394,7 @@ def main(argv=None):
             if args.no_preview:
                 return True
             if not opened:
+                report('Opening live preview window...')
                 cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(WINDOW, min(1280, image.shape[1]),
                                  round(image.shape[0] * min(1, 1280 / image.shape[1])))
@@ -355,6 +405,14 @@ def main(argv=None):
                 return False
             return cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) >= 1
 
+        if args.self_test:
+            detector = load_detector()
+            report('Testing NCNN inference without the camera...')
+            detector.infer(np.full((384, 384), 128, np.uint8))
+            report('NCNN self-test passed')
+            return 0
+        if args.image or args.video:
+            detector = load_detector()
         if args.image:
             frame = cv2.imread(str(args.image))
             if frame is None:
@@ -376,6 +434,8 @@ def main(argv=None):
                     print(json.dumps({'detections': boxes, 'stats': detector.last_stats}))
                 if not show(frame, boxes, detector.last_stats):
                     return 0
+        report(f'Opening camera {args.device or args.camera_name or args.camera or "(auto)"}; '
+               f'requested {args.width}x{args.height} at {args.fps:g} FPS...')
         if linux:
             source = ProcessCapture(vars(args))
         else:
@@ -384,29 +444,41 @@ def main(argv=None):
             source = MainThreadCapture(cap) if sys.platform == 'darwin' else LatestFrameCapture(cap)
             cap = None
         next_report = 0
-        with source as capture, DetectionWorker(detector) as worker:
-            while True:
-                frame, age, _ = capture.read()
-                now = time.monotonic()
-                worker.submit(frame, now - age / 1000)
-                if worker.error:
-                    raise RuntimeError(f'NCNN inference failed: {worker.error}') from worker.error
-                try:
-                    analyzed, stamp, boxes, stats = worker.results.get_nowait()
-                except queue.Empty:
-                    # Keep imshow/waitKey responsive while inference is running.
-                    if not args.no_preview and opened:
-                        key = cv2.waitKey(1) & 0xFF
-                        if key in (ord('q'), ord('Q'), 27) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
-                            return 0
-                    continue
-                stats['result_age_ms'] = round((now - stamp) * 1000, 1)
-                if now >= next_report:
-                    print(json.dumps({'detections': boxes, 'stats': stats}), flush=True)
-                    next_report = now + 2
-                # Draw on the exact analyzed frame, never on a newer camera frame.
-                if not show(analyzed, boxes, stats):
-                    return 0
+        with source as capture:
+            report('Waiting for first camera frame...')
+            frame, age, _ = capture.read()
+            stamp = time.monotonic() - age / 1000
+            report(f'Camera live: {frame.shape[1]}x{frame.shape[0]}')
+            # Display the camera BEFORE starting model loading or native inference.
+            if not args.no_preview and not show(live_view(frame, None, time.monotonic(), 'Starting NCNN'),
+                                                 [], {}, prepared=True):
+                return 0
+            last_result = None
+            with DetectionWorker(factory=load_detector) as worker:
+                while True:
+                    now = time.monotonic()
+                    worker.submit(frame, stamp)
+                    if worker.error:
+                        raise RuntimeError(f'NCNN inference failed: {worker.error}') from worker.error
+                    try:
+                        last_result = worker.results.get_nowait()
+                    except queue.Empty:
+                        pass
+                    if now >= next_report:
+                        if last_result is None:
+                            report('Camera live; ' + worker.status)
+                        else:
+                            _, result_stamp, boxes, stats = last_result
+                            stats = dict(stats, result_age_ms=round((now - result_stamp) * 1000, 1))
+                            print(json.dumps({'detections': boxes, 'stats': stats}), flush=True)
+                        next_report = now + 2
+                    # imshow and waitKey execute for every capture, including when
+                    # the result queue is empty or a native inference is slow.
+                    if not args.no_preview and not show(live_view(frame, last_result, now, worker.status),
+                                                         [], {}, prepared=True):
+                        return 0
+                    frame, age, _ = capture.read()
+                    stamp = time.monotonic() - age / 1000
     except KeyboardInterrupt:
         return 0
     except (OSError, RuntimeError, ValueError, cv2.error) as exc:

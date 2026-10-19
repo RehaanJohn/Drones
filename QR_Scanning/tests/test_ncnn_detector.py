@@ -1,9 +1,10 @@
 import importlib.util
+import queue
 from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -33,6 +34,57 @@ class GeometryTests(unittest.TestCase):
         original = frame.copy()
         detector.draw(frame,[{'box':[40,40,120,120],'confidence':.8}],{})
         np.testing.assert_array_equal(frame,original)
+
+
+class LivePreviewTests(unittest.TestCase):
+    def capture(self, frames):
+        capture = MagicMock()
+        capture.__enter__.return_value = capture
+        capture.read.side_effect = [(frame, 0, None) for frame in frames]
+        return capture
+
+    def test_camera_window_opens_before_ncnn_model_initialization(self):
+        capture = self.capture([np.full((120,160,3),70,np.uint8)])
+        with patch.object(detector.sys,'platform','linux'), \
+                patch.object(detector,'ProcessCapture',return_value=capture), \
+                patch.object(detector,'NCNNQRDetector') as model, \
+                patch.object(cv2,'namedWindow'), patch.object(cv2,'resizeWindow'), \
+                patch.object(cv2,'imshow') as show, patch.object(cv2,'waitKey',return_value=ord('q')), \
+                patch.object(cv2,'destroyWindow'), patch('builtins.print'):
+            self.assertEqual(detector.main(['--device','/dev/video0']),0)
+        show.assert_called_once()
+        model.assert_not_called()
+        capture.__exit__.assert_called_once()
+
+    def test_live_pixels_keep_changing_without_new_inference_results(self):
+        frames = [np.full((120,160,3),value,np.uint8) for value in (40,80,120)]
+        capture = self.capture(frames)
+        worker = MagicMock()
+        worker.__enter__.return_value = worker
+        worker.error, worker.status = None, 'Inference ready'
+        worker.results = queue.Queue()
+        worker.results.put((np.full_like(frames[0],200),0,[],{}))
+        shown = []
+        with patch.object(detector.sys,'platform','linux'), \
+                patch.object(detector,'ProcessCapture',return_value=capture), \
+                patch.object(detector,'DetectionWorker',return_value=worker), \
+                patch.object(cv2,'namedWindow'), patch.object(cv2,'resizeWindow'), \
+                patch.object(cv2,'imshow',side_effect=lambda name,image: shown.append(image.copy())), \
+                patch.object(cv2,'waitKey',side_effect=[-1,-1,-1,ord('q')]), \
+                patch.object(cv2,'getWindowProperty',return_value=1), \
+                patch.object(cv2,'destroyWindow'), patch('builtins.print'):
+            self.assertEqual(detector.main(['--device','/dev/video0']),0)
+        self.assertEqual([int(frame[50,30,0]) for frame in shown],[40,40,80,120])
+        self.assertEqual(worker.submit.call_count,3)
+        # The analyzed image belongs only in the inset, never over the live view.
+        self.assertEqual(int(shown[-1][-10,-10,0]),200)
+
+    def test_live_view_has_no_stale_boxes_on_current_frame(self):
+        current = np.full((400,640,3),80,np.uint8)
+        old = np.full_like(current,180)
+        result = (old,10,[{'box':[20,80,100,160],'confidence':.9}],{})
+        image = detector.live_view(current,result,12,'Inference ready')
+        np.testing.assert_array_equal(image[80:160,20:100],current[80:160,20:100])
 
 
 @unittest.skipUnless(importlib.util.find_spec('ncnn') and (detector.MODEL_DIR/'detect.bin').is_file(),

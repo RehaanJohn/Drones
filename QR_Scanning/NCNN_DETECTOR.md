@@ -29,9 +29,23 @@ exits. Normal camera startup is offline. Provenance and notices are in
 
 Omit `--camera` for desktop camera discovery, or use `--camera-name "NAME"`.
 Linux uses `--device /dev/video0` with process-isolated V4L2 capture. Q, Escape,
-or closing the window exits. Camera inference runs in a latest-frame worker;
-the window displays the analyzed frame and its age, so boxes are not attached
-to a newer, unrelated frame. Inference does not block HighGUI key polling.
+or closing the window exits. The main `cv2.imshow` view displays every current
+camera frame, including before the first inference result. Model loading and
+inference run in a latest-frame worker after the camera preview opens. A labelled
+inset shows the last analyzed frame, its boxes and age; old boxes are not painted
+over the live camera frame. Startup stages print immediately to the terminal.
+
+If startup appears stuck, run from inside `QR_Scanning`:
+
+```bash
+python -u ncnn_detector.py --device /dev/video0 --diagnostics
+# Isolate model loading/inference from the camera and desktop display:
+python -u ncnn_detector.py --self-test --threads 1
+```
+
+The preview requires a graphical desktop/display connection. The self-test does
+not open a camera or window. Report the last printed startup stage if either
+command stops making progress.
 
 ```bash
 # Small/distant target search; slower and more permissive than defaults.

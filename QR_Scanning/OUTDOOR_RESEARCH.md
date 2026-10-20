@@ -1,5 +1,9 @@
 # Outdoor QR detection and the A3 / 10 m target
 
+This file records historical research and measurements. Current architecture, one-frame
+confirmation default and 95%-within-one-second target are documented in
+[PERFORMANCE.md](PERFORMANCE.md). Older benchmark figures below are not a field qualification.
+
 ## USB webcam implementation update
 
 The live scanner now targets Linux V4L2 USB webcams on Pi 4, with process-isolated

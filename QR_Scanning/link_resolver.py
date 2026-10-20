@@ -68,6 +68,7 @@ def resolve_url(url, timeout=5.0):
     """Return text or a concise error; no browser, cookies, or JavaScript execution."""
     url = url.strip()
     result = {"url": url}
+    started = time.monotonic()
     try:
         validate_public_url(url)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), PublicRedirectHandler())
@@ -86,6 +87,8 @@ def resolve_url(url, timeout=5.0):
                 raise ValueError("Page is larger than the 1 MB limit")
             encoding = response.headers.get_content_charset() or "utf-8"
             body = raw.decode(encoding, errors="replace")
+        fetched = time.monotonic()
+        result['fetch_ms'] = (fetched-started)*1000
         if content_type in ("text/html", "application/xhtml+xml"):
             content = extract_page_text(body)
         elif content_type == "application/json":
@@ -95,11 +98,13 @@ def resolve_url(url, timeout=5.0):
         if not content:
             raise ValueError("No readable text found; the page may require JavaScript or login")
         result["content"] = content[:MAX_CONTENT_CHARS]
+        result['extraction_ms'] = (time.monotonic()-fetched)*1000
         if len(content) > MAX_CONTENT_CHARS:
             result["truncated"] = True
     except Exception as exc:
         # A bad/offline URL must not take down the scanner or the worker.
         result["error"] = str(exc) or type(exc).__name__
+    result['resolve_ms'] = (time.monotonic()-started)*1000
     return result
 
 
@@ -125,13 +130,17 @@ class LinkResolver:
     def _worker(self):
         while not self.stop.is_set():
             try:
-                url = self.requests.get(timeout=0.1)
+                url, queued_at = self.requests.get(timeout=0.1)
             except queue.Empty:
                 continue
             if self.stop.is_set():
                 break
             try:
-                result = self.fetch(url)
+                began = time.monotonic()
+                result = dict(self.fetch(url))
+                result['http_queue_ms'] = (began-queued_at)*1000
+                result.setdefault('resolve_ms', (time.monotonic()-began)*1000)
+                result['cached'] = False
             except Exception as exc:
                 result = {"url": url, "error": str(exc) or type(exc).__name__}
             while not self.stop.is_set():
@@ -146,13 +155,14 @@ class LinkResolver:
         cached = self.cache.get(url)
         if cached and cached[0] > time.monotonic():
             self.cache.move_to_end(url)
-            return [(url, captured_at, cached[1])]
+            return [(url, captured_at, dict(cached[1], cached=True, http_queue_ms=0,
+                                           fetch_ms=0, extraction_ms=0, resolve_ms=0))]
         if url in self.pending:
             return []
         if len(self.pending) >= 18:
             return [(url, captured_at, {"url": url, "error": "Link lookup queue is full"})]
         try:
-            self.requests.put_nowait(url)
+            self.requests.put_nowait((url, time.monotonic()))
         except queue.Full:
             return [(url, captured_at, {"url": url, "error": "Link lookup queue is full"})]
         self.pending[url] = captured_at

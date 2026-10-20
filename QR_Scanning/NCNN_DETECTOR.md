@@ -125,3 +125,10 @@ tests skip when its optional runtime/models are unavailable.
 `validation/synthetic_recovery.json` records before/after decoder checks and
 NCNN target-center detection on synthetic images. These are software regression
 checks, not an outdoor range measurement.
+
+## Shared scanner integration
+
+The standalone entrypoint remains detection-only. Shared inference now lives in
+`ncnn_model.py`. The main scanner can use individual NCNN views in its independent
+recovery process with `--localizer hybrid`; see [PERFORMANCE.md](PERFORMANCE.md).
+That integration does not run this script's entire multi-pass sweep every frame.

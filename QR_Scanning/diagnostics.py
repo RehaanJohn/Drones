@@ -182,6 +182,7 @@ class DiagnosticSession:
                       incorrect_payloads=sorted({p for r in rows for p in r['incorrect_payloads']}),
                       first_confirmation_s=min(times, default=None),
                       confirmation_within_2s=bool(times and min(times) <= 2),
+                      confirmation_within_1s=bool(times and min(times) <= 1),
                       latency_p95_ms=float(np.percentile(latencies, 95)) if latencies else None,
                       minimum_module_px=min((r['minimum_module_px'] for r in rows
                                              if r['minimum_module_px'] is not None), default=None))
@@ -325,6 +326,8 @@ def report(directory):
         decoded = sum(t['decoded_frames'] for t in trials)
         confirmed = sum(t['confirmed_frames'] for t in trials)
         success = sum(t['confirmation_within_2s'] for t in trials)
+        fast_success = sum(t.get('confirmation_within_1s', t.get('first_confirmation_s') is not None
+                              and t['first_confirmation_s'] <= 1) for t in trials)
         if __package__:
             from .qualification import binomial_lower
         else:
@@ -336,6 +339,8 @@ def report(directory):
                          correct_decode_rate=decoded / samples if samples and expected is not None else None,
                          confirmed_frame_rate=confirmed / samples if samples else None,
                          within_2s_trials=success, within_2s_trial_rate=success / len(trials),
+                         within_1s_trials=fast_success, within_1s_trial_rate=fast_success / len(trials),
+                         within_1s_lower_95=binomial_lower(fast_success, len(trials)) if expected is not None else None,
                          within_2s_lower_95=binomial_lower(success, len(trials)) if expected is not None else None,
                          incorrect_payloads=sorted({p for t in trials for p in t['incorrect_payloads']})))
     target = Path(directory) / 'comparison.json'

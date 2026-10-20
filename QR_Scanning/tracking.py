@@ -361,6 +361,9 @@ class TrackingDecoder:
         window = cv2.createHanningWindow((width, height), cv2.CV_32F)
         total, used = reference.copy(), 1
         for old in list(track.crops)[:-1]:
+            # Averaging across exposure changes or unrelated crop sizes smears modules.
+            if abs(float(old.mean()) - float(roi.mean())) > 20 or abs(old.shape[1] / old.shape[0] - roi.shape[1] / roi.shape[0]) > .15:
+                continue
             image = cv2.resize(old, (width, height), interpolation=cv2.INTER_CUBIC).astype(np.float32)
             # OpenCV can apply the Hanning window in place to floating inputs.
             # Preserve unwindowed pixels for averaging and subsequent alignment.
@@ -462,7 +465,7 @@ class TrackingDecoder:
             self.attempted += 1
             x1, y1, x2, y2 = regions[index]
             tile = np.ascontiguousarray(frame[y1:y2, x1:x2])
-            modes = (*self.owner.LIGHTING_MODES, 'raw') if self.owner.lighting else ('raw',)
+            modes = ('raw', *self.owner.LIGHTING_MODES) if self.owner.lighting else ('raw',)
             mode = modes[sweep % len(modes)]
             view = tile if mode == 'raw' else self.owner.correct_lighting(tile, mode)
             method, found = 'tile/' + mode, self._read(view)

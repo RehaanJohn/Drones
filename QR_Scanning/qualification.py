@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import platform
+import queue
 import time
 
 import cv2
@@ -75,16 +76,21 @@ def summarize(trials):
         successes = sum(row['success'] for row in positive)
         wrong = sum(bool(row['incorrect_payloads']) for row in rows)
         lower = binomial_lower(successes, len(positive))
+        eligible_successes = sum(row['success'] for row in eligible)
+        eligible_rate = eligible_successes/len(eligible) if eligible else 0
         summary[condition] = {'positive_attempts': len(positive), 'successes': successes,
                               'negative_attempts': len(rows) - len(positive), 'incorrect_attempts': wrong,
                               'one_sided_95pct_lower_bound': lower,
                               'eligible_10m_attempts': len(eligible),
-                              'qualification_pass': len(eligible) >= 300
-                              and binomial_lower(sum(row['success'] for row in eligible), len(eligible)) >= .99 and wrong == 0}
+                              'eligible_10m_success_rate': eligible_rate,
+                              'eligible_one_sided_95pct_lower_bound': binomial_lower(eligible_successes, len(eligible)),
+                              'qualification_pass': len(eligible) >= 100 and eligible_rate >= .95 and wrong == 0,
+                              'statistically_supported_95pct': len(eligible) >= 100
+                              and binomial_lower(eligible_successes, len(eligible)) >= .95 and wrong == 0}
     return summary
 
 
-def replay_trial(path, trial, legacy=False, budget_ms=150):
+def replay_trial(path, trial, legacy=False, budget_ms=150, interval=0, deadline_s=1):
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f'Cannot open video: {path}')
@@ -134,7 +140,7 @@ def replay_trial(path, trial, legacy=False, budget_ms=150):
             else:
                 observations = engine.observe(frame, index, stamp)
             elapsed = time.perf_counter() - begin
-            available = stamp + max(.1, elapsed)
+            available = stamp + max(interval, elapsed)
             processed += 1
             times.append(elapsed * 1000)
             candidate_seen |= any(o['corners'] is not None for o in observations)
@@ -147,7 +153,7 @@ def replay_trial(path, trial, legacy=False, budget_ms=150):
     expected = set(trial['expected'])
     wrong = sorted(set(confirmed) - expected)
     latencies = [confirmed.get(payload, math.inf) for payload in expected]
-    success = processed > 0 and all(latency <= 2 for latency in latencies) and not wrong
+    success = processed > 0 and all(latency <= deadline_s for latency in latencies) and not wrong
     failure = None if success else ('incorrect_payload' if wrong else
                'no_processed_frames' if not processed else 'decode_or_confirmation' if candidate_seen else 'localization_or_image_quality')
     return {'id': trial['id'], 'condition': trial['condition'], 'expected': sorted(expected),
@@ -159,6 +165,107 @@ def replay_trial(path, trial, legacy=False, budget_ms=150):
             'decode_p95_ms': float(np.percentile(times, 95)) if times else None,
             'cpu_seconds': time.process_time() - cpu_start, 'evaluation_seconds': time.perf_counter() - wall_start,
             'methods': sorted(methods), 'system': system_metrics()}
+
+
+def replay_realtime(path, trial, localizer='heuristic', confidence=.6, threads=1,
+                    fast_budget_ms=33, budget_ms=150, deadline_s=1):
+    """Paced replay through the actual two analysis processes, including contention.
+
+    Model construction finishes before target entry. Lazy recovery initialization,
+    IPC and scheduling are included. USB and HTTP are deliberately not simulated.
+    """
+    if __package__:
+        from .realtime import ProcessDecoder
+    else:
+        from realtime import ProcessDecoder
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f'Cannot open video: {path}')
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        cap.release()
+        raise ValueError('Recording must have a positive frame rate')
+    start, end = float(trial['start_s']), float(trial.get('end_s', trial['start_s']+2))
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        cap.release()
+        raise ValueError('Invalid trial interval')
+    options = dict(width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                   localizer=localizer, ncnn_confidence=confidence, ncnn_threads=threads,
+                   qr_modules=trial.get('modules', 29), fast_budget_ms=fast_budget_ms, budget_ms=budget_ms)
+    confirmed, methods, times, worker_ids = {}, set(), [], set()
+    submitted = 0
+    candidate_seen = False
+    worker_stats = {}
+    try:
+        with ProcessDecoder(options) as worker:
+            worker.wait_ready()
+            base = time.monotonic()
+            def consume():
+                nonlocal candidate_seen
+                worker.poll()
+                if worker.error:
+                    raise worker.error
+                while True:
+                    try:
+                        observation = worker.confirmed.get_nowait()
+                    except queue.Empty:
+                        break
+                    value = observation['result_monotonic']-base
+                    confirmed[observation['payload']] = min(value, confirmed.get(observation['payload'], math.inf))
+                while True:
+                    try:
+                        observations, stats = worker.results.get_nowait()
+                    except queue.Empty:
+                        break
+                    worker_ids.add((stats['worker'], stats['frame_id']))
+                    times.append(stats['decode_ms'])
+                    methods.update(stats['methods'])
+                    candidate_seen |= any(o['corners'] is not None for o in observations)
+            previous, index = -1, 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                stamps = trial.get('timestamps')
+                if stamps is not None and index >= len(stamps):
+                    raise ValueError('Timestamp list is shorter than recording')
+                stamp = float(stamps[index]) if stamps is not None else index/fps
+                index += 1
+                if not math.isfinite(stamp) or stamp <= previous:
+                    raise ValueError('Capture timestamps must be finite and increasing')
+                previous = stamp
+                if stamp < start:
+                    continue
+                if stamp > end:
+                    break
+                target = base+stamp-start
+                while time.monotonic() < target:
+                    consume()
+                    time.sleep(min(.005, max(0, target-time.monotonic())))
+                worker.submit(((index, target, None, frame),))
+                submitted += 1
+                consume()
+            # Include completion of in-flight jobs; late results remain late.
+            finish = max(base+end-start, time.monotonic())+.25
+            while time.monotonic() < finish:
+                consume()
+                time.sleep(.005)
+            worker_stats = dict(worker.workers_stats)
+    finally:
+        cap.release()
+    expected = set(trial['expected'])
+    wrong = sorted(set(confirmed)-expected)
+    success = submitted > 0 and all(confirmed.get(p, math.inf) <= deadline_s for p in expected) and not wrong
+    return dict(id=trial['id'], condition=trial['condition'], expected=sorted(expected),
+                distance_m=trial.get('distance_m'), stable_hover=trial.get('stable_hover'),
+                obliquity_deg=trial.get('obliquity_deg'), confirmed_latency_s=confirmed,
+                success=success, incorrect_payloads=wrong, engine=localizer, workers=worker_stats,
+                submitted_frames=submitted, observed_worker_updates=len(worker_ids),
+                failure_stage=None if success else 'incorrect_payload' if wrong else
+                              'decode_or_confirmation' if candidate_seen else 'localization_or_image_quality',
+                decode_p50_ms=float(np.median(times)) if times else None,
+                decode_p95_ms=float(np.percentile(times, 95)) if times else None,
+                methods=sorted(methods), system=system_metrics())
 
 
 def record(args):
@@ -208,6 +315,13 @@ def main(argv=None):
     replay.add_argument('--output', type=Path, required=True)
     replay.add_argument('--compare-legacy', action='store_true')
     replay.add_argument('--budget-ms', type=float, default=150)
+    replay.add_argument('--engine', choices=('current', 'heuristic', 'hybrid'), default='heuristic')
+    replay.add_argument('--compare-all', action='store_true', help='Paced heuristic/hybrid workers plus current baseline')
+    replay.add_argument('--interval', type=float, default=.1, help='Current baseline scan interval only')
+    replay.add_argument('--deadline-s', type=float, default=1)
+    replay.add_argument('--fast-budget-ms', type=float, default=33)
+    replay.add_argument('--ncnn-confidence', type=float, default=.6)
+    replay.add_argument('--ncnn-threads', type=int, default=1)
     recording = sub.add_parser('record')
     recording.add_argument('--device')
     recording.add_argument('--output', type=Path, required=True)
@@ -230,6 +344,10 @@ def main(argv=None):
     else:
         manifest = json.loads(args.manifest.read_text(encoding='utf-8'))
         rows, old = [], []
+        comparisons = {name: [] for name in ('current', 'heuristic', 'hybrid')}
+        if (not all(math.isfinite(v) and v > 0 for v in (args.deadline_s, args.budget_ms, args.fast_budget_ms))
+                or not math.isfinite(args.interval) or args.interval < 0 or not 0 < args.ncnn_confidence < 1 or args.ncnn_threads < 1):
+            parser.error('Invalid replay timing or NCNN settings')
         ids = set()
         for trial in manifest['trials']:
             if trial['id'] in ids:
@@ -239,14 +357,23 @@ def main(argv=None):
             if 'timestamps_file' in trial:
                 trial['timestamps'] = json.loads((args.manifest.parent / trial['timestamps_file']).read_text())
             path = args.manifest.parent / trial['video']
-            rows.append(replay_trial(path, trial, budget_ms=args.budget_ms))
+            for name in comparisons if args.compare_all else (args.engine,):
+                if name == 'current':
+                    row = replay_trial(path, trial, budget_ms=args.budget_ms, interval=args.interval, deadline_s=args.deadline_s)
+                else:
+                    row = replay_realtime(path, trial, name, args.ncnn_confidence, args.ncnn_threads,
+                                          args.fast_budget_ms, args.budget_ms, args.deadline_s)
+                comparisons[name].append(row)
+            rows.append(comparisons[args.engine][-1])
             if args.compare_legacy:
-                old.append(replay_trial(path, trial, legacy=True))
+                old.append(replay_trial(path, trial, legacy=True, interval=args.interval, deadline_s=args.deadline_s))
             print(f'{trial["id"]}: success={rows[-1]["success"]}, latency={rows[-1]["confirmed_latency_s"]}', flush=True)
         report = {'platform': platform.platform(), 'opencv': cv2.__version__, 'results': rows,
                   'summary': summarize(rows), 'legacy_results': old, 'legacy_summary': summarize(old),
+                  'comparisons': {name: dict(results=items, summary=summarize(items)) for name, items in comparisons.items() if items},
+                  'target': dict(distance_m=10, correct_fraction=.95, deadline_s=args.deadline_s, trials_per_condition=100),
                   'replay_gate_pass': all(summarize(rows).get(category, {}).get('qualification_pass', False)
-                                            for category in ('sun', 'shade', 'overcast', 'backlight', 'transition')),
+                                            for category in ('sun', 'shade', 'backlight', 'mixed_shadows', 'low_light')),
                   'field_qualified': False,
                   'limitations': 'Replay measures decoder compute and skips unavailable frames. It excludes live USB/preview/output latency '
                                  'and does not prove independent trials, capture timing accuracy, or 10m geometry. '

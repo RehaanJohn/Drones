@@ -62,7 +62,17 @@ def inspect(device):
     # Device-node numbers are not an identity. Prefer persistent USB ID; otherwise bus identity.
     bus = re.search(r'Bus info\s*:\s*(.+)', info)
     identity = str(device) if '/by-id/' in str(device) else (bus[1].strip() if bus else str(Path(device).resolve()))
-    return {'device': str(device), 'identity': identity,
+    usb = {}
+    node = Path('/sys/class/video4linux') / Path(device).resolve().name / 'device'
+    for parent in (node.resolve(), *node.resolve().parents):
+        if (parent / 'idVendor').is_file():
+            for field in ('idVendor', 'idProduct', 'product', 'manufacturer', 'speed'):
+                try:
+                    usb[field] = (parent / field).read_text().strip()
+                except OSError:
+                    pass
+            break
+    return {'device': str(device), 'identity': identity, 'usb': usb,
             'key': hashlib.sha256(identity.encode()).hexdigest()[:16],
             'info': info, 'formats_raw': formats, 'modes': parse_modes(formats),
             'controls': parse_controls(controls)}

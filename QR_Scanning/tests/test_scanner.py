@@ -304,7 +304,7 @@ class ScannerTests(unittest.TestCase):
         writer = scanner.ScanWriter(output)
         with patch('builtins.print') as log:
             writer.record('hello\nworld', stamp)
-        log.assert_called_once_with('[14:23:05] QR: hello\\nworld', flush=True)
+        log.assert_called_once_with('[14:23:05] Result: hello\\nworld', flush=True)
         record = json.loads(output.getvalue())
         self.assertEqual(record['data'], 'hello\nworld')
         self.assertEqual(record['time'], '2026-10-11T14:23:05.123+05:30')

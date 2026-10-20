@@ -5,6 +5,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -15,7 +16,9 @@ import numpy as np
 
 SHM_SLOTS = 6
 DYNAMIC_KEYS = ('actual_size', 'measured_fps', 'read_and_decompress_ms', 'capture_count',
-                'capture_cpu_percent', 'last_exposure_change_monotonic')
+                'capture_cpu_percent', 'last_exposure_change_monotonic', 'acquisition_ms',
+                'jpeg_decode_ms', 'shared_memory_write_ms', 'read_started_monotonic',
+                'timestamp_kind')
 
 
 def replace_latest(channel, value):
@@ -72,12 +75,14 @@ def _enable_gray_capture(cap):
     return False
 
 
-def _linux_capture(options, channel, commands, slot_locks, slot_versions):
+def _linux_capture(options, channel, commands, slot_locks, slot_versions, stop=None):
     # Imported only inside the spawned child; the parent can terminate any stalled native call.
     if __package__:
         from . import linux_camera
     else:
         import linux_camera
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    cv2.setNumThreads(1)
     cap = shm = None
     try:
         device = options.get('device')
@@ -92,6 +97,7 @@ def _linux_capture(options, channel, commands, slot_locks, slot_versions):
         if not cap.isOpened():
             raise RuntimeError('Could not open ' + profile['device'])
         profile = linux_camera.configure(cap, profile, options)
+        profile['runtime'] = runtime_inventory()
         gray_mode = bool(options.get('gray_capture')) and _enable_gray_capture(cap)
         if options.get('gray_capture'):
             print('Grayscale MJPEG capture ' + ('enabled' if gray_mode else 'unavailable; using color capture'),
@@ -105,9 +111,10 @@ def _linux_capture(options, channel, commands, slot_locks, slot_versions):
         started, count, failures = time.monotonic(), 0, 0
         cpu_started = time.process_time()
         next_control = next_profile = 0
-        while True:
+        while stop is None or not stop.is_set():
             begin = time.monotonic()
             ok, frame = cap.read()
+            acquired = time.monotonic()
             if ok and gray_mode and frame is not None:
                 frame = cv2.imdecode(frame.reshape(-1), cv2.IMREAD_GRAYSCALE)
             end = time.monotonic()
@@ -126,6 +133,11 @@ def _linux_capture(options, channel, commands, slot_locks, slot_versions):
             profile['actual_size'] = [width, height]
             profile['measured_fps'] = count / max(.001, end - started)
             profile['read_and_decompress_ms'] = round((end - begin) * 1000, 2)
+            profile['acquisition_ms'] = round((acquired - begin) * 1000, 2) if gray_mode else None
+            profile['jpeg_decode_ms'] = round((end - acquired) * 1000, 2) if gray_mode else None
+            profile['read_started_monotonic'] = begin
+            profile['timestamp_kind'] = 'read_complete_after_decompression'
+            profile['gray_capture_active'] = gray_mode
             profile['capture_count'] = count
             profile['capture_cpu_percent'] = 100 * (time.process_time() - cpu_started) / max(.001, end - started)
             if options.get('adaptive_exposure') and end >= next_control:
@@ -152,9 +164,12 @@ def _linux_capture(options, channel, commands, slot_locks, slot_versions):
             captured = datetime.datetime.now().astimezone()
             if shm is not None and frame.nbytes <= slot_bytes:
                 slot = count % slots
+                copy_started = time.monotonic()
                 with slot_locks[slot]:
                     np.ndarray(frame.shape, np.uint8, buffer=shm.buf, offset=slot * slot_bytes)[...] = frame
                     slot_versions[slot] = count
+                profile['shared_memory_write_ms'] = (time.monotonic() - copy_started) * 1000
+                dynamic['shared_memory_write_ms'] = profile['shared_memory_write_ms']
                 replace_latest(channel, ('shm', (slot, frame.shape, count), end, captured, full, dynamic))
             else:
                 replace_latest(channel, ('frame', frame, end, captured, full, dynamic))
@@ -193,6 +208,7 @@ class ProcessCapture:
         self.context = mp.get_context('spawn')
         self.slot_locks = self.slot_versions = None
         self.candidates = []
+        self.stop = None
 
     def _start(self):
         self.received_since_restart = 0
@@ -207,15 +223,19 @@ class ProcessCapture:
             options['shm_name'] = None
         self.channel = self.context.Queue(maxsize=2)
         self.commands = self.context.Queue(maxsize=1)
+        self.stop = self.context.Event()
         self.slot_locks = [self.context.Lock() for _ in range(SHM_SLOTS)]
         self.slot_versions = self.context.Array('Q', SHM_SLOTS, lock=False)
         self.process = self.context.Process(target=_linux_capture,
                                             args=(options, self.channel, self.commands,
-                                                  self.slot_locks, self.slot_versions), daemon=True)
+                                                  self.slot_locks, self.slot_versions, self.stop), daemon=True)
         self.process.start()
 
     def _close(self):
         if self.process is not None:
+            if self.stop is not None:
+                self.stop.set()
+                self.process.join(.5)
             if self.process.is_alive():
                 self.process.terminate()
             self.process.join(2)
@@ -277,9 +297,19 @@ class ProcessCapture:
         while True:
             try:
                 message = self.channel.get(timeout=self.timeout if timeout is None else timeout)
+                # Drain notifications, retaining any full profile and never swallowing errors.
+                while message[0] != 'error':
+                    if message[4] is not None:
+                        self.profile = message[4]
+                    try:
+                        newer = self.channel.get_nowait()
+                    except queue.Empty:
+                        break
+                    message = newer
                 if message[0] == 'error':
                     raise RuntimeError(message[1])
                 kind, payload, stamp, captured, full, dynamic = message
+                copy_started = time.monotonic()
                 if kind == 'shm':
                     frame = self._copy_shared_frame(payload)
                     if frame is None:
@@ -290,6 +320,8 @@ class ProcessCapture:
                     self.profile = full
                 if self.profile is not None:
                     self.profile.update(dynamic)
+                    self.profile['shared_memory_read_ms'] = (time.monotonic() - copy_started) * 1000
+                    self.profile['queue_residence_ms'] = (copy_started - stamp) * 1000
                     self.received_since_restart += 1
                     self.profile['capture_queue_drops'] = max(0, self.profile.get('capture_count', 0) - self.received_since_restart)
                 self.captured_monotonic = stamp
@@ -319,10 +351,12 @@ class DecoderWorker:
         self.observations = []
         self.stats = {}
         self.dropped_results = 0
+        self.confirmed = queue.Queue(128)
         self.thread = threading.Thread(target=self._run, name='qr-decode', daemon=True)
         self.seen = deque(maxlen=128)
         self.settings = queue.Queue(1)
         self.minimum_stamp = None
+        self.result_sink = None
 
     def set_lighting(self, enabled, since=None):
         replace_latest(self.settings, (bool(enabled), since))
@@ -395,6 +429,14 @@ class DecoderWorker:
                     step = max(1, int(np.ceil(max(frame.shape[:2]) / 320)))
                     processed['image_quality'] = quality(frame[::step, ::step])
                 self.observations = observations
+                for observation in observations:
+                    if observation['confirmed'] and observation['payload']:
+                        observation.update(result_monotonic=completed,
+                                           decode_ms=self.detector.last_stats.get('decode_ms', 0))
+                        try:
+                            self.confirmed.put_nowait(observation)
+                        except queue.Full as exc:
+                            raise RuntimeError('Confirmed result queue full; output must catch up') from exc
                 self.stats = dict(self.detector.last_stats, worker_ms=(completed - started) * 1000,
                                   frame_age_ms=(completed - stamp) * 1000,
                                   processed_frames=[processed], completed_monotonic=completed)
@@ -411,6 +453,12 @@ class DecoderWorker:
     def __exit__(self, *exc):
         self.stop.set()
         self.thread.join(2)
+        if self.result_sink:
+            while True:
+                try:
+                    self.result_sink([self.confirmed.get_nowait()])
+                except queue.Empty:
+                    break
         if self.thread.is_alive():
             print('Decoder is finishing a native call; pending results will be discarded.', file=sys.stderr)
 
@@ -419,6 +467,7 @@ class OutputWorker:
     def __init__(self, writer, save_frames=None, observations=False):
         self.writer, self.save_frames, self.log_observations = writer, save_frames, observations
         self.queue = queue.Queue(16)
+        self.confirmed = queue.Queue(128)
         self.stop = threading.Event()
         self.error = None
         self.dropped = 0
@@ -428,7 +477,13 @@ class OutputWorker:
         self.thread.start()
         return self
 
-    def submit(self, observations, frame=None):
+    def submit(self, observations, frame=None, deliver_confirmed=True):
+        for observation in observations if deliver_confirmed else ():
+            if observation['confirmed'] and observation['payload']:
+                try:
+                    self.confirmed.put_nowait(observation)
+                except queue.Full as exc:
+                    raise RuntimeError('Confirmed output queue full; result not silently discarded') from exc
         try:
             self.queue.put_nowait((observations, frame))
         except queue.Full:
@@ -437,7 +492,13 @@ class OutputWorker:
 
     def _run(self):
         try:
-            while not self.stop.is_set() or not self.queue.empty():
+            while not self.stop.is_set() or not self.queue.empty() or not self.confirmed.empty():
+                while True:
+                    try:
+                        observation = self.confirmed.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.writer.record(observation['payload'], observation['captured_at'], observation)
                 try:
                     observations, saved = self.queue.get(timeout=.1)
                 except queue.Empty:
@@ -449,14 +510,13 @@ class OutputWorker:
                         if record['captured_at'] is not None:
                             record['captured_at'] = record['captured_at'].isoformat()
                         self.writer._write(record)
-                    if observation['confirmed'] and observation['payload']:
-                        self.writer.record(observation['payload'], observation['captured_at'])
                 self.writer.poll_links()
                 if saved is not None and self.save_frames:
                     stamp, image = saved
                     path = Path(self.save_frames) / (stamp.strftime('%Y%m%d_%H%M%S_%f') + '.png')
                     if not cv2.imwrite(str(path), image):
                         raise OSError(f'Could not save {path}')
+            self.writer.cancel_pending()
         except Exception as exc:
             self.error = exc
 
@@ -467,6 +527,32 @@ class OutputWorker:
             raise RuntimeError('Output worker did not finish within three seconds')
         if self.error:
             raise RuntimeError(f'Output worker failed: {self.error}') from self.error
+
+
+def runtime_inventory():
+    """Build facts, not assumptions about a wheel's JPEG/SIMD configuration."""
+    import platform
+    return dict(platform=platform.platform(), machine=platform.machine(),
+                python=platform.python_version(), opencv=cv2.__version__,
+                opencv_threads=cv2.getNumThreads(),
+                codec_build=[line.strip() for line in cv2.getBuildInformation().splitlines()
+                             if any(key in line for key in ('JPEG:', 'SIMD', 'NEON', 'Parallel framework'))])
+
+
+def live_overlay(frame, analysis=None):
+    """Current camera remains untouched by stale geometry; evidence gets its own inset."""
+    image = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) if frame.ndim == 2 else frame.copy()
+    cv2.putText(image, 'LIVE CAMERA | Q / Esc to quit', (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 220, 255), 1)
+    if analysis is not None:
+        source, observations, stamp = analysis
+        thumb = overlay(source, observations)
+        h, w = image.shape[:2]
+        tw, th = max(1, int(w * .4)), max(1, int(h * .4))
+        image[h-th:, w-tw:] = cv2.resize(thumb, (tw, th), interpolation=cv2.INTER_AREA)
+        cv2.putText(image, f'Last analysis: {(time.monotonic()-stamp)*1000:.0f} ms old',
+                    (w-tw, max(45, h-th-8)), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 220, 255), 1)
+    return image
 
 
 def overlay(frame, observations):

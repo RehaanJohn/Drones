@@ -130,7 +130,7 @@ class DiagnosticsTests(unittest.TestCase):
         capture.__exit__ = Mock(return_value=False)
         capture.read.side_effect = KeyboardInterrupt
         with tempfile.TemporaryDirectory() as directory, patch.object(scanner, 'QRScanner'), patch.object(scanner, 'open_camera'), patch.object(scanner, 'configure_camera'), patch.object(scanner, 'MainThreadCapture', return_value=capture), patch.object(scanner.sys, 'platform', 'darwin'), patch.object(scanner, 'Preview') as preview, patch.object(diagnostics, 'DiagnosticSession') as experiment:
-            self.assertEqual(scanner.main(['--camera','1','--competition','--diagnostics','--no-resolve-links',
+            self.assertEqual(scanner.main(['--camera','1','--competition','--diagnostics',
                                            '--output',str(Path(directory)/'scans.jsonl')]),0)
         preview.assert_not_called()
         experiment.assert_not_called()

@@ -2,8 +2,13 @@
 
 Targets a 1080p USB webcam on Raspberry Pi 4, with Windows and macOS preview support.
 Uses native-resolution decoding, candidate tracking, quality-directed recovery
-and two-frame confirmation. **10 m / 99% within two seconds remains a field
-qualification target, not a measured capability.**
+and one valid decode by default (`--confirm-frames 2` opts into repetition).
+**10 m / 95% within one second is the stationary field target, not a measured capability.**
+
+Linux now uses independent capture, fast-decoding and recovery processes. Native
+grayscale capture is the default; NCNN integration is opt-in with `--localizer hybrid`.
+See [PERFORMANCE.md](PERFORMANCE.md) for the Pi run commands, capture benchmarks,
+resolved-content event schema, architecture and field qualification procedure.
 
 ## Run
 
@@ -14,7 +19,7 @@ Windows development (preview enabled by default):
 ```
 
 Q, Esc or closing the window stops scanning. Orange outlines are provisional;
-green means the payload matches in two distinct captured frames. Preview is
+green means a valid payload met the configured confirmation count. Old analysis stays in a labelled inset. Preview is
 independent of decoding. Input frames retain native resolution. Windows camera
 discovery remains available through `--list-cameras`; indices can change after
 USB reconnection.
@@ -64,7 +69,7 @@ python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --d
 
 The display draws yellow outlines around localized QR candidates, cyan around
 decoded payloads awaiting confirmation, and green around payloads confirmed in
-two distinct frames. Localization can continue beyond the distance at which a
+the configured number of distinct frames (one by default). Localization can continue beyond the distance at which a
 payload is readable, but arbitrary distant pixels cannot reliably be identified
 as a QR. Boxes expire after 0.75 seconds and carry an estimated native pixels/module
 reading based on `--qr-modules`. The panel shows brightness, contrast, sampled
@@ -132,11 +137,11 @@ python3 diagnostics.py --report diagnostic_runs
 `comparison.json` groups condition, distance, simulation settings, recovery,
 expected payload, trial duration and camera/decoder configuration. Confidence
 bounds assume independent trials; a handful of successful trials cannot establish
-99% reliability. The diagnostic display and simulations add overhead, so repeat
+95% reliability. The diagnostic display and simulations add overhead, so repeat
 latency measurements in competition mode for the final operating conditions.
 
 Competition mode uses the same improved decoder and lighting recovery, with
-preview, simulations and diagnostic trial recording disabled:
+preview disabled unless `--preview` is supplied, and simulations/trial-panel recording disabled:
 
 ```bash
 python3 scanner.py --camera-name "MacBook Air Camera" --backend avfoundation --competition
@@ -206,62 +211,64 @@ settling latency. Validate settling using recordings and control-change timestam
 
 ## Decoder and output
 
-Every `--discovery-every 3` processed frames reserves discovery before crop work,
-even while other codes decode. Global and native tiled discovery alternate so
-neither can starve. Additional discovery runs after unsuccessful crop work when
-affordable. Native decoder calls cannot be interrupted: `--budget-ms 150` is a
-scheduling budget, not a hard deadline. Candidates are serviced oldest-first.
+Linux defaults to `--pipeline realtime --localizer heuristic`: fresh native grayscale
+frames feed independent fast crop and discovery/recovery processes. `--localizer hybrid`
+adds NCNN proposals to the recovery process. Every fourth recovery job advances an
+independent 384/192-pixel overlapping tile search. Original views precede corrections.
+The fast process uses ZXing crops, bounded enlargement and checked optical flow;
+WeChat and lighting recovery run in the other process. A 33 ms fast budget and
+150 ms recovery budget are scheduling targets, not hard native-call deadlines.
 
-Recovery tries untouched crops, the last successful recipe, upscaling, and a
-rotating ladder of WeChat, aligned frame fusion, CLAHE, shadow normalization,
-sharpening, perspective correction and adaptive thresholding. Successful recovery
-is retried on the next capture, allowing prompt multi-frame confirmation.
-Lighting-corrected crops and tiles retain WeChat fallback. Native tile sweeps
-also rotate through raw and lighting variants, including color-channel extraction.
-`--no-lighting` disables corrections in both crop and fusion paths as well as tiles.
+`--pipeline current` retains the previous single decoder worker for comparisons.
+Its `--discovery-every`, `--tile-size`, and `--tiles-per-frame` controls apply only
+to that pipeline. `--interval` defaults to zero; use 0.1 to reproduce the old
+scan-start cap. The existing still-image and mission APIs remain unchanged.
 
-The recent-frame cache retains at most 0.5 seconds and 64 MiB. Best-history
-selection uses tracked regions when available, followed by re-localization.
-Linux shared-memory slots use locks and generation checks: overwritten messages
-are discarded, and a frame copy cannot overlap a writer. Active frames, worker queues and native libraries use additional memory; this
-is not a total-process memory limit. Separate capture, decode and output workers
-have bounded queues and report dropped results.
+Shared-memory slots have generation checks and locks. Camera and analysis updates
+can be replaced by newer frames. Confirmed payload delivery uses a separate bounded
+queue; output overload raises an explicit error instead of silently dropping a result.
+The 0.5-second/64 MiB display history is not the total memory limit of the workers.
 
 | Option | Purpose |
 | --- | --- |
-| `--qr-modules 29` | Actual symbol modules per side, excluding border; default is an estimate. |
-| `--budget-ms 150` | Scheduling budget before native-call overruns. |
-| `--tile-size 640 --tiles-per-frame 2` | Native discovery tiles with 25% overlap; count is an upper bound. |
-| `--tiles-per-frame 0` | Disable tiled discovery, retaining initial full-frame acquisition and tracking. |
-| `--interval 0.10` | Minimum interval between decode batches. |
-| `--no-lighting` / `--no-zxing` | Ablation controls for comparisons. |
-| `--diagnostics` | Timings, observed FPS, queue drops, CPU and Pi temperature/throttling when available. |
-| `--log-observations` | Add structured provisional/confirmed observations to JSONL. |
-| `--save-frames DIRECTORY` | Asynchronously save a native PNG about every two seconds. |
-| `--no-preview` | Disable preview; `--competition` also disables PNG saving. |
-| `--no-resolve-links` | Disable HTTP lookup. |
+| `--pipeline auto\|current\|realtime` | Auto selects realtime on Linux, current on desktops. |
+| `--localizer heuristic\|hybrid` | Hybrid requires realtime and the pinned NCNN runtime. |
+| `--fast-budget-ms 33` | Fast worker scheduling target. |
+| `--budget-ms 150` | Recovery scheduling target; native calls may overrun. |
+| `--ncnn-confidence 0.6 --ncnn-threads 1` | Initial hybrid settings to qualify on the Pi. |
+| `--qr-modules 29` | Actual symbol module count excluding quiet zone; default is an estimate. |
+| `--confirm-frames 1` | Valid decodes required from distinct frames. |
+| `--gray-capture` / `--color-capture` | Grayscale MJPEG is the realtime Linux default. |
+| `--interval 0` | No compulsory wait between fresh frames. |
+| `--diagnostics` | Compact timing/worker/camera telemetry; compatible with grayscale. |
+| `--log-observations` | Also persist provisional and confirmed geometry. |
+| `--preview` | Force live `cv.imshow`, including with competition mode. |
+| `--no-preview` | Disable the normal live window. |
+| `--no-resolve-links` | Decoder-only experiment; rejected with competition mode. |
+
+Normal output for a URL is now:
 
 ```text
-[14:23:05] QR: https://qr-codes.io/zuabFE
-[14:23:05] Link content (https://qr-codes.io/zuabFE): 69
+[14:23:05] Resolving: https://qr-codes.io/zuabFE
+[14:23:05] Result: 69
 ```
 
-Times mean completion of the confirming camera read, not exposure start or HTTP
-completion. Payloads are preserved and terminal control characters escaped.
-Original `time`/`data` JSONL records remain compatible; optional `observation`
-records add geometry, frame/track IDs, methods, quality and confirmation.
-`link_content` events remain separate asynchronous results. Scan counters must
-exclude those additional event types.
+The URL is provenance; `type: result`, `schema_version: 2`, `status: ok` contains
+page text in both `data` and `content`. Raw URL events have `type: decoded` and
+`status: resolving`; `link_content` events remain for older readers. Filter by
+event type. Failed lookups emit `resolution_failed` with null content and an error.
+Direct non-URL QR text is already content and emits one final result.
 
-HTTP resolution retains bounded workers, caching, public-URL validation, response
-limits and a five-second network timeout. It handles static HTML/text/JSON, not
-logged-in or JavaScript-rendered pages. Network failure does not invalidate QR
-decoding.
+HTTP uses bounded asynchronous workers, request deduplication, a 60-second success
+cache, five-second error cache, public URL checks, response limits and socket timeouts.
+Static HTML/plain text/JSON are supported; a browser is not launched for JavaScript
+or login pages. Pending lookups on shutdown produce explicit failure events.
 
-`read_and_decompress_ms` combines camera read and decompression: this OpenCV path
-cannot separately time sensor exposure, USB transfer and JPEG decoding. Timestamps
-are read-completion times. The preview's `ppm~` estimate depends on the supplied
-module count and must not be mistaken for a calibrated range guarantee.
+Each final result identifies the source frame, original payload and final URL, with
+decode, HTTP queue/fetch/extraction, publication and read-completion-to-content timings.
+These are **not exposure-to-content timings**. Grayscale capture separately measures
+compressed-frame acquisition and JPEG decompression. Acquisition still combines
+camera/driver wait and USB transfer. Color capture exposes only their combined duration.
 
 Library compatibility: `QRScanner.decode(frame)` returns provisional payload
 strings for still-image callers. `observe(frame, frame_id, timestamp, captured_at)`
@@ -280,7 +287,7 @@ the 280 mm A3 example, and the distinction between detection and readable range.
 For the decoder's outdoor tests, keep lighting recovery enabled and start with:
 
 ```bash
-python QR_Scanning/scanner.py --width 1920 --height 1080 --budget-ms 300 --diagnostics --no-resolve-links
+python QR_Scanning/scanner.py --width 1920 --height 1080 --localizer heuristic --diagnostics
 ```
 
 The larger scheduling budget gives difficult crops more recovery opportunities,
@@ -347,17 +354,18 @@ python QR_Scanning/benchmark.py --output QR_Scanning/benchmark_output/stills.jso
 python -m unittest discover -s QR_Scanning/tests -v
 ```
 
-Replay skips frames unavailable under measured decoder compute, and applies
-two-frame confirmation to both implementations. It reports latency, wrong payloads,
-negative controls, coarse failure stage, and exact one-sided binomial bounds.
-It does not model the full asynchronous history scheduler or live USB/output
-latency, and cannot distinguish optics from localization solely from a missed QR.
+Replay defaults to the actual fast/recovery processes with timestamp-paced frames.
+`--compare-all` runs current, optimized heuristic and hybrid NCNN on each identical
+trial. Each trial creates fresh workers; model construction completes before target
+entry, while lazy recovery initialization and IPC remain in measured latency.
+Ground truth is used only by the evaluator, never passed to the decoding workers.
 
-The replay gate requires at least 300 eligible 10 m trials per daylight category
-(`sun`, `shade`, `overcast`, `backlight`, `transition`), a 95% lower success
-bound of at least 99%, and no wrong confirmed payloads. Zero failures in 300
-independent attempts satisfies that bound. Final field acceptance additionally
-requires live end-to-end latency and sustained Pi thermal/motion testing.
+The initial gate requires at least 100 eligible stationary 10 m trials per condition
+(`sun`, `shade`, `backlight`, `mixed_shadows`, `low_light`), at least 95% correct within
+one second, and no wrong confirmed payloads. Empirical acceptance and exact one-sided
+95% confidence bounds are reported separately: 95/100 successes does not statistically
+establish 95% reliability. Live USB/preview/HTTP latency and sustained Pi thermal/motion
+tests remain necessary. `field_qualified` stays false in replay reports.
 
 Historical optical research and earlier benchmark results are in
 [OUTDOOR_RESEARCH.md](OUTDOOR_RESEARCH.md).

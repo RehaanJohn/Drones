@@ -13,6 +13,7 @@ import time
 import urllib.request
 
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
 import cv2
 import numpy as np
 
@@ -340,6 +341,7 @@ class ScanWriter:
         self.cooldown = cooldown
         self.last_seen = {}
         self.resolver = resolver
+        self.pending_context = {}
 
     def _write(self, record):
         self.stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -351,7 +353,7 @@ class ScanWriter:
         readable = json.dumps(value, ensure_ascii=False)[1:-1]
         print(f"[{captured_at:%H:%M:%S}] {label}: {readable}", flush=True)
 
-    def record(self, payload, captured_at=None):
+    def record(self, payload, captured_at=None, observation=None):
         if not payload:
             return False
         now = time.monotonic()
@@ -362,32 +364,63 @@ class ScanWriter:
         if payload in self.last_seen:
             return False
         captured_at = captured_at or datetime.datetime.now().astimezone()
+        context = dict(observation or {})
+        context.setdefault('result_monotonic', now)
+        context.setdefault('capture_monotonic', now)
         record = {
             "time": captured_at.isoformat(timespec="milliseconds"),
             "data": payload,
         }
-        self._write(record)
-        self._print(captured_at, "QR", payload)
         self.last_seen[payload] = now
         if self.resolver is not None and is_web_url(payload):
+            self._write(dict(record, type='decoded', schema_version=2, status='resolving',
+                             frame_id=context.get('frame_id')))
+            self._print(captured_at, 'Resolving', payload)
+            self.pending_context.setdefault(payload.strip(), context)
             for result in self.resolver.submit(payload, captured_at):
                 self._record_link(*result)
+        else:
+            self._final_result(payload, captured_at, {'content': payload}, context,
+                               status='decoded_only' if is_web_url(payload) else 'ok', now=now)
         return True
+
+    def _final_result(self, payload, captured_at, result, context, status=None, now=None):
+        now = time.monotonic() if now is None else now
+        status = status or ('ok' if 'content' in result else 'resolution_failed')
+        completed = context.get('result_monotonic', now)
+        captured = context.get('capture_monotonic', completed)
+        self._write(dict(schema_version=2, type='result', status=status,
+                         time=captured_at.isoformat(timespec='milliseconds'),
+                         completed_at=datetime.datetime.now().astimezone().isoformat(timespec='milliseconds'),
+                         data=result.get('content'), content=result.get('content'),
+                         original_payload=payload, final_url=result.get('url'),
+                         frame_id=context.get('frame_id'), error=result.get('error'),
+                         cached=result.get('cached', False), truncated=result.get('truncated', False),
+                         timings=dict(decode_ms=context.get('decode_ms'),
+                             read_complete_to_decode_ms=max(0, (completed-captured)*1000),
+                             publication_ms=max(0, (now-completed)*1000-result.get('resolve_ms', 0)-result.get('http_queue_ms', 0)),
+                             http_queue_ms=result.get('http_queue_ms', 0), fetch_ms=result.get('fetch_ms', 0),
+                             extraction_ms=result.get('extraction_ms', 0), resolve_ms=result.get('resolve_ms', 0),
+                             read_complete_to_content_ms=max(0, (now-captured)*1000)),
+                         timestamp_kind='read_complete_after_decompression'))
+        self._print(captured_at, 'Result' if status == 'ok' else status,
+                    result.get('content', result.get('error', 'Content unavailable')))
 
     def _record_link(self, payload, captured_at, result):
         self._write({"type": "link_content", "time": captured_at.isoformat(timespec="milliseconds"),
                      "data": payload, "link": result})
-        content = result.get("content")
-        if content is not None:
-            display = content[:500] + ("..." if len(content) > 500 or result.get("truncated") else "")
-            self._print(captured_at, f"Link content ({payload})", display)
-        else:
-            self._print(captured_at, f"Link content ({payload})", "unavailable - " + result["error"])
+        self._final_result(payload, captured_at, result, self.pending_context.pop(payload.strip(), {}))
 
     def poll_links(self):
         if self.resolver is not None:
             for result in self.resolver.poll():
                 self._record_link(*result)
+
+    def cancel_pending(self):
+        self.poll_links()
+        for payload, context in list(self.pending_context.items()):
+            captured = context.get('captured_at') or datetime.datetime.now().astimezone()
+            self._record_link(payload, captured, {'url': payload, 'error': 'Scanner stopped before lookup completed'})
 
 
 def scan_frame(detector, frame, writer, captured_at=None):
@@ -653,6 +686,14 @@ def make_parser():
     parser.add_argument("--profile-dir", type=Path, help="Save validated Linux camera profiles here")
     parser.add_argument("--competition", action="store_true", help="Headless Pi profile; disables preview and frame saving")
     parser.add_argument('--camera-test', action='store_true', help='Preview raw camera frames without QR processing; optionally save with --save-frames')
+    parser.add_argument('--test-seconds', type=float, default=30, help='Linux capture-only benchmark duration')
+    parser.add_argument('--benchmark-output', type=Path, help='Linux capture benchmark JSON report')
+    parser.add_argument('--pipeline', choices=('auto', 'current', 'realtime'), default='auto',
+                        help='auto uses separate fast/recovery processes on Linux; current retains baseline')
+    parser.add_argument('--localizer', choices=('heuristic', 'hybrid'), default='heuristic')
+    parser.add_argument('--fast-budget-ms', type=float, default=33, help='Fast crop scheduling target, not a native-call timeout')
+    parser.add_argument('--ncnn-confidence', type=float, default=.6)
+    parser.add_argument('--ncnn-threads', type=int, default=1)
     parser.add_argument("--exposure-us", type=int, help="Linux manual exposure in microseconds, e.g. 1000; uses discovered controls")
     parser.add_argument("--adaptive-exposure", action="store_true", help="Opt in to bounded candidate-metered Linux exposure control")
     parser.add_argument("--max-exposure-us", type=int, default=2000, help="Motion-calibrated exposure ceiling for adaptive control")
@@ -663,7 +704,9 @@ def make_parser():
     parser.add_argument("--target-ppm", type=float, default=5.0, help="Pixels per module that small candidates are upscaled toward before decoding")
     parser.add_argument("--discovery-every", type=int, default=3, help="Reserve full-frame/tile discovery every N frames, including while other codes decode")
     parser.add_argument("--try-invert", action="store_true", help="Also look for inverted (light-on-dark) QR codes; doubles ZXing work")
-    parser.add_argument("--gray-capture", action="store_true", help="Linux: decode MJPEG straight to grayscale and skip color conversion (not with --diagnostics)")
+    capture_color = parser.add_mutually_exclusive_group()
+    capture_color.add_argument("--gray-capture", action="store_true", help="Linux: decode MJPEG straight to grayscale; default for realtime")
+    capture_color.add_argument('--color-capture', action='store_true', help='Keep color for controlled comparisons or visual diagnostic simulations')
     parser.add_argument("--log-observations", action="store_true", help="Include provisional geometry/quality records in JSONL")
     parser.add_argument("--list-cameras", action="store_true", help="List current camera names, indices/devices, and backends")
     parser.add_argument("--backend", choices=("auto", "msmf", "dshow", "avfoundation", "v4l2", "any"),
@@ -680,10 +723,12 @@ def make_parser():
     parser.add_argument("--gain", type=float, help="Raw camera gain value")
     parser.add_argument("--tile-size", type=int, default=640, help="Native-resolution tile edge (>=128)")
     parser.add_argument("--tiles-per-frame", type=int, default=2, help="Rolling tiles per discovery pass; 0 disables tile discovery")
-    parser.add_argument("--interval", type=float, default=SCAN_INTERVAL, help="Minimum seconds between scan starts")
+    parser.add_argument("--interval", type=float, default=0, help="Minimum seconds between scan starts; default processes fresh frames immediately")
     parser.add_argument("--no-zxing", action="store_true", help="Use OpenCV decoders only")
     parser.add_argument("--no-lighting", action="store_true", help="Disable lighting variants for comparisons")
-    parser.add_argument("--no-preview", action="store_true", help="Disable the default OpenCV camera window")
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument("--no-preview", action="store_true", help="Disable the default OpenCV camera window")
+    display.add_argument('--preview', action='store_true', help='Show live camera even in competition mode')
     parser.add_argument("--no-resolve-links", action="store_true", help="Log QR URLs without fetching their text")
     parser.add_argument("--diagnostics", action="store_true", help="Show diagnostic test controls and quality metrics; competition prints statistics only")
     parser.add_argument('--diagnostics-dir', type=Path, help='Parent directory for timestamped diagnostic runs, trials and snapshots')
@@ -726,10 +771,23 @@ def main(argv=None):
         if value is not None and not math.isfinite(value):
             parser.error(f'--{name} must be finite')
     linux = sys.platform.startswith('linux')
-    if args.gray_capture and (not linux or args.diagnostics):
-        parser.error('--gray-capture requires Linux and cannot be combined with --diagnostics')
-    if args.camera_test and (linux or args.competition or args.no_preview):
-        parser.error('--camera-test requires a desktop camera with preview enabled')
+    realtime = args.pipeline == 'realtime' or (args.pipeline == 'auto' and linux)
+    if realtime:
+        cv2.setNumThreads(1)
+    if not math.isfinite(args.fast_budget_ms) or args.fast_budget_ms <= 0 or not math.isfinite(args.test_seconds) or args.test_seconds <= 0:
+        parser.error('Fast budget and test duration must be positive and finite')
+    if not math.isfinite(args.ncnn_confidence) or not 0 < args.ncnn_confidence < 1 or args.ncnn_threads < 1:
+        parser.error('NCNN confidence must be between 0 and 1 and threads positive')
+    if args.localizer == 'hybrid' and not realtime:
+        parser.error('--localizer hybrid requires --pipeline realtime')
+    if args.competition and args.no_resolve_links:
+        parser.error('--competition requires fetched page content; remove --no-resolve-links')
+    if args.gray_capture and not linux:
+        parser.error('--gray-capture requires Linux')
+    if linux and realtime and not args.color_capture:
+        args.gray_capture = True
+    if args.camera_test and not linux and (args.competition or args.no_preview):
+        parser.error('Desktop --camera-test requires preview')
     if not linux and (args.device or args.inspect_camera or args.exposure_us or args.profile_dir or args.adaptive_exposure):
         parser.error('--device, --inspect-camera, --exposure-us and --profile-dir require Linux V4L2')
     if linux and (args.exposure is not None or args.auto_exposure is not None):
@@ -737,10 +795,13 @@ def main(argv=None):
     if linux and (args.camera_name or args.backend not in ('auto', 'v4l2')):
         parser.error('Linux capture uses --device or --camera and --backend v4l2/auto')
     if args.competition:
-        args.no_preview, args.save_frames = True, None
+        args.no_preview, args.save_frames = not args.preview, None
     cap = resolver = preview = diagnostic = None
     try:
         if args.camera_test:
+            if linux:
+                return _component('capture_benchmark').run(vars(args), args.test_seconds,
+                    args.benchmark_output, preview=not args.no_preview)
             return camera_test(args)
         if args.list_cameras or args.inspect_camera:
             if linux:
@@ -755,7 +816,7 @@ def main(argv=None):
         args.output.parent.mkdir(parents=True, exist_ok=True)
         if args.save_frames:
             args.save_frames.mkdir(parents=True, exist_ok=True)
-        detector = QRScanner(tile_size=args.tile_size, tiles_per_frame=args.tiles_per_frame,
+        detector = None if realtime else QRScanner(tile_size=args.tile_size, tiles_per_frame=args.tiles_per_frame,
                              use_zxing=not args.no_zxing, lighting=not args.no_lighting,
                              budget_ms=args.budget_ms, modules=args.qr_modules,
                              confirm_frames=args.confirm_frames, invert=args.try_invert,
@@ -769,7 +830,7 @@ def main(argv=None):
             source = MainThreadCapture(cap) if sys.platform == 'darwin' else LatestFrameCapture(cap)
             cap = None
         preview = None if args.no_preview else Preview()
-        if args.diagnostics and not args.competition:
+        if args.diagnostics and not args.competition and not args.gray_capture and not realtime:
             DiagnosticSession = _component('diagnostics').DiagnosticSession
             directory = (args.diagnostics_dir or (Path(__file__).resolve().parent / 'diagnostic_runs')) / datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             options = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -780,10 +841,19 @@ def main(argv=None):
                 preview.enable_diagnostics()
             print(f'Diagnostic results: {directory.resolve()}', flush=True)
         resolver = None if args.no_resolve_links else LinkResolver()
+        worker = _component('realtime').ProcessDecoder(vars(args)) if realtime else DecoderWorker(detector, args.interval, diagnostics=diagnostic is not None)
+        print(f'[startup] Opening camera {args.device or args.camera or "(auto)"}; '
+              f'{args.width}x{args.height} at requested {args.fps:g} FPS; '
+              f'pipeline={"realtime" if realtime else "current"}, localizer={args.localizer}, '
+              f'links={"enabled" if resolver is not None else "disabled"}, preview={preview is not None}',
+              file=sys.stderr, flush=True)
         with args.output.open('a', encoding='utf-8') as stream:
             writer = ScanWriter(stream, resolver=resolver)
-            with source as capture, OutputWorker(writer, args.save_frames, args.log_observations) as output, DecoderWorker(detector, args.interval, diagnostics=diagnostic is not None) as decoder:
+            with source as capture, OutputWorker(writer, args.save_frames, args.log_observations) as output, worker as decoder:
+                decoder.result_sink = output.submit
                 history = FrameHistory()
+                analysis = None
+                preview_count = 0
                 next_report, count, started, cpu_started = 0, 0, time.monotonic(), time.process_time()
                 profile_saved = False
                 reported_mode = None
@@ -794,8 +864,10 @@ def main(argv=None):
                         controls = preview.controls() if preview is not None else diagnostic.controls
                         frame = diagnostic.prepare(frame, time.monotonic(), controls)
                     # Show diagnostics after consuming completed observations below.
-                    if diagnostic is None and preview is not None and not preview.show(overlay(frame, decoder.observations)):
-                        return 0
+                    if diagnostic is None and preview is not None:
+                        if not preview.show(_component('pipeline').live_overlay(frame, analysis)):
+                            return 0
+                        preview_count += 1
                     height, width = frame.shape[:2]
                     if (width, height) != (args.width, args.height):
                         if sys.platform != 'darwin':
@@ -816,10 +888,22 @@ def main(argv=None):
                         raise RuntimeError(f'Output failed: {output.error}') from output.error
                     while True:
                         try:
+                            confirmed = decoder.confirmed.get_nowait()
+                        except queue.Empty:
+                            break
+                        output.submit([confirmed])
+                    while True:
+                        try:
                             observations, stats = decoder.results.get_nowait()
                         except queue.Empty:
                             break
-                        output.submit(observations)
+                        # Confirmation delivery is independent of replaceable diagnostic batches.
+                        if args.log_observations:
+                            output.submit(observations, deliver_confirmed=False)
+                        source_id = observations[0]['frame_id'] if observations else stats.get('frame_id')
+                        matching = next((item for item in reversed(history.snapshot()) if item[0] == source_id), None)
+                        if matching is not None:
+                            analysis = (matching[3], observations, matching[1])
                         if diagnostic is not None:
                             diagnostic.consume(observations, stats)
                         if linux and args.adaptive_exposure:
@@ -830,12 +914,14 @@ def main(argv=None):
                         next_report = now + 2
                         elapsed = max(.001, now - started)
                         stats = dict(decoder.stats, delivered_fps=round(count / elapsed, 2),
+                                     preview_fps=round(preview_count / elapsed, 2),
                                      history_mb=round(history.bytes / 1024**2, 2),
                                      cpu_percent=round(100 * (time.process_time() - cpu_started) / elapsed, 1),
                                      output_drops=output.dropped, result_drops=decoder.dropped_results,
                                      **(system_metrics() if args.diagnostics else {}))
                         if linux and capture.profile:
-                            stats['camera'] = capture.profile
+                            stats['camera'] = {key: value for key, value in capture.profile.items()
+                                               if key not in ('info', 'formats_raw', 'modes', 'controls')}
                             if args.profile_dir and not profile_saved and elapsed >= 2:
                                 linux_camera.save_profile(args.profile_dir, capture.profile)
                                 profile_saved = True
